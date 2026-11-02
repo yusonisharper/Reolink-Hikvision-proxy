@@ -1,0 +1,13 @@
+<VersionInfo version="1.1">
+<name>${name}</name>
+<type>${model}</type>
+<serialNumber>${serial}</serialNumber>
+<buildDay>build ${build_day}</buildDay>
+<hardwareVersion>${hardware}</hardwareVersion>
+<cfgVersion>v3.0.0.0</cfgVersion>
+<firmwareVersion>${firmware}</firmwareVersion>
+<detail>${detail}</detail>
+<IEClient>IEClient</IEClient>
+<pakSuffix>pak</pakSuffix>
+<helpVersion>blackPointsLevel=0</helpVersion>
+</VersionInfo>

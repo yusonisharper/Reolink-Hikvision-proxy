@@ -1,0 +1,17 @@
+<SystemGeneral version="1.1">
+<timeZone>${tz_offset}</timeZone>
+<osdFormat>YMD</osdFormat>
+<year>${year}</year>
+<month>${month}</month>
+<day>${day}</day>
+<hour>${hour}</hour>
+<minute>${minute}</minute>
+<second>${second}</second>
+<deviceId>0</deviceId>
+<timeFormat>0</timeFormat>
+<language>English</language>
+<deviceName>${name}</deviceName>
+</SystemGeneral>
+<Norm version="1.1">
+<norm>NTSC</norm>
+</Norm>

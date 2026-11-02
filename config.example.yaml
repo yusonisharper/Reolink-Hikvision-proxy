@@ -1,0 +1,81 @@
+# reolink-hik-proxy 配置示例
+# 每个 camera 条目 = 一台"虚拟 Reolink 摄像头"，背后是一台海康摄像头。
+# NVR 用 Reolink 协议（Baichuan, TCP 9000）连接 listen 地址。
+
+log_level: info          # debug 可看到每条海康告警的映射结果
+trace: false             # true: 打印每条解密后的 Baichuan 消息（调试 NVR 兼容性用）
+
+# 可选：放真机抓到的回复模板（tools/bc_dump.py --templates 生成）
+# 查找顺序：templates_dir/<camera name>/<id>.xml > templates_dir/<id>.xml > 内置默认
+templates_dir: ./captured
+
+# NVR / App 写入的设置（改名、OSD、图像参数等）保存在这里，重启后保留。
+# 目录结构：state/<camera name>/<消息id>.xml，name.txt 存显示名称。删掉对应文件即可恢复默认。
+state_dir: ./state
+
+# NVR 发来但没有模板的"读"请求如何回复：ok(200) 或 error(400)
+unknown_reply: ok
+
+# 可选：海康 "HTTP 监听/报警主机" 推送模式的接收端口（camera.hik.events = listen 时使用）
+# hik_listen: 0.0.0.0:8088
+
+cameras:
+  - name: driveway
+    # 每台虚拟摄像头建议用独立 IP（macvlan / ip addr add），端口保持 9000，
+    # NVR 手动添加时填这个 IP，协议选 Reolink。
+    listen: 192.168.1.201:9000
+    username: admin            # NVR 添加摄像头时填写的用户名/密码
+    password: "change-me"
+    encryption: full_aes       # 接受的最高加密：none | bc | aes | full_aes（Reolink NVR 需要 full_aes）
+    # nego_class: 0x6614       # 协商回复的头部 class，排查用：0x6614（默认，与真机样本一致）或 0x0000
+
+    # 设备身份（NVR 会显示，部分功能可能按型号判断）
+    model: RLC-811A
+    # 实验性：用 <Performance> 回复这些消息 ID（NVR 通道信息里的码率 / CPU）。
+    # 已实测 112/132 不生效，默认关闭；拿到真机结构后再启用。见 README“兼容性状态”。
+    # performance:
+    #   msg_ids: [112, 132]
+    #   probe: false
+    # display_name: 车道      # NVR/App 里显示的初始名称，默认用 name；在 NVR/App 里改名后以 state 为准
+    # uid: 95270000ABCDEFGH    # 不填则随机生成（每次重启会变，建议固定）
+    # serial: 00000000000000
+    # firmware: v3.1.0.2368_23062700
+
+    hik:
+      host: 192.168.1.64
+      port: 80
+      username: admin
+      password: "hik-password"
+      sync_name: true          # 在 NVR/App 里改名时，同步修改海康通道名称（画面 OSD 上的名字）
+      channel: 1               # 告警里的 channelID；NVR 型海康请改成对应通道
+      main_rtsp: rtsp://admin:hik-password@192.168.1.64:554/Streaming/Channels/101
+      sub_rtsp:  rtsp://admin:hik-password@192.168.1.64:554/Streaming/Channels/102
+      snapshot_path: /ISAPI/Streaming/channels/101/picture
+      events: alertstream      # alertstream(主动拉取) | listen(海康推送) | none
+      # 跳过 ffprobe 自动探测（可选）:
+      # main_info: {codec: H265, width: 3840, height: 2160, fps: 20}
+      # sub_info:  {codec: H264, width: 640, height: 360, fps: 15}
+
+    events:
+      # 向 NVR 声明支持的 AI 目标类型：people | vehicle | dog_cat | face
+      ai_types: [people, vehicle]
+
+      # 智能侦测区域。zone 是 Reolink 的区域编号(0 起)，对应海康 regionID-1。
+      # 只有在这里声明的类型才会作为 smartAI 上报，其余仍会按人/车 + 移动上报。
+      smart:
+        crossline:             # 海康 linedetection（越界）
+          - {zone: 0, name: Gate, targets: [people, vehicle]}
+          - {zone: 1, name: Road, targets: [vehicle]}
+        intrusion:             # 海康 fielddetection / regionEntrance（区域入侵/进入）
+          - {zone: 0, name: Yard, targets: [people]}
+        loitering: []          # 海康 loitering（徘徊）
+
+      # 海康的越界/入侵多为单次脉冲告警，这里把它们保持 N 秒，让 NVR 能触发录像
+      hold: {motion: 3, ai: 5, smart: 5}
+      ai_implies_motion: true          # 有人/车/智能事件时 status 同时置 MD
+      untargeted_smart_target: null    # 非 AcuSense 机型越界无目标类型时，可设为 people
+      region_base: 1                   # 海康 regionID 从 1 开始
+
+      # 覆盖默认映射（键不区分大小写）
+      # event_map: {regionExiting: intrusion, PIR: motion}
+      # target_map: {nonMotorVehicle: people}

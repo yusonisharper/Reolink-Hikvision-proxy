@@ -1,0 +1,37 @@
+<AbilityInfo version="1.1">
+<userName>${username}</userName>
+<system>
+<subModule>
+<abilityValue>general_rw, norm_rw, version_ro, uid_ro, autoReboot_rw, restore_rw, reboot_rw, shutdown_rw, dst_rw, log_ro, performance_ro, upgrade_rw, export_rw, import_rw, bootPwd_rw</abilityValue>
+</subModule>
+</system>
+<network>
+<subModule>
+<abilityValue>port_rw, dns_rw, email_rw, ipFilter_rw, localLink_rw, pppoe_rw, upnp_rw, wifi_rw, ntp_rw, netStatus_rw, ptop_rw, autontp_rw</abilityValue>
+</subModule>
+</network>
+<alarm>
+<subModule>
+<channelId>0</channelId>
+<abilityValue>motion_rw, push_rw, aiCfg_rw</abilityValue>
+</subModule>
+</alarm>
+<image>
+<subModule>
+<channelId>0</channelId>
+<abilityValue>ispBasic_rw, ispAdvance_rw</abilityValue>
+</subModule>
+</image>
+<video>
+<subModule>
+<channelId>0</channelId>
+<abilityValue>osdName_rw, osdTime_rw, shelter_rw</abilityValue>
+</subModule>
+</video>
+<streaming>
+<subModule>
+<channelId>0</channelId>
+<abilityValue>mainStream_ro, subStream_ro, snap_ro</abilityValue>
+</subModule>
+</streaming>
+</AbilityInfo>

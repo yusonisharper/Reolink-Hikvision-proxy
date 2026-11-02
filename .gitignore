@@ -1,0 +1,17 @@
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+.venv/
+venv/
+
+# local config / runtime data (may contain passwords, captured device data)
+config.yaml
+state/
+captured/
+*.pcap
+*.pcapng
+log*.txt
+*.h264
+*.h265
+*.jpg

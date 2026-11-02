@@ -1,0 +1,11 @@
+<AiCfg version="1.1">
+<channelId>0</channelId>
+<smartTrack>0</smartTrack>
+<smartTrackMode>0</smartTrackMode>
+<smartTrackModeAbility>0</smartTrackModeAbility>
+<detectType>${detect_types}</detectType>
+<smartTrackType>none</smartTrackType>
+<smartTrackPt>0</smartTrackPt>
+<smartTrackObjectStopDelay>20</smartTrackObjectStopDelay>
+<smartTrackObjectDisappearDelay>10</smartTrackObjectDisappearDelay>
+</AiCfg>

@@ -1,0 +1,21 @@
+<VideoInput version="1.1">
+<channelId>0</channelId>
+<bright>128</bright>
+<contrast>128</contrast>
+<saturation>128</saturation>
+<hue>128</hue>
+<sharpen>128</sharpen>
+</VideoInput>
+<InputAdvanceCfg version="1.1">
+<channelId>0</channelId>
+<PowerLineFrequency>
+<enable>1</enable>
+<mode>60hz</mode>
+</PowerLineFrequency>
+<Exposure>
+<mode>auto</mode>
+</Exposure>
+<DayNight>
+<mode>auto</mode>
+</DayNight>
+</InputAdvanceCfg>
