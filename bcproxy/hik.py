@@ -191,8 +191,11 @@ class HikHttp:
             r = await self._send(method, path, body)
         return r
 
-    async def put_bytes(self, path: str, body: bytes) -> tuple[int, bytes]:
-        r = await self.request("PUT", path, body)
+    async def post_bytes(self, path: str, body: bytes) -> tuple[int, bytes]:
+        return await self.put_bytes(path, body, method="POST")
+
+    async def put_bytes(self, path: str, body: bytes, method: str = "PUT") -> tuple[int, bytes]:
+        r = await self.request(method, path, body)
         try:
             data = await asyncio.wait_for(r.read_all(), self.timeout) if (
                 "content-length" in r.headers or "chunked" in r.headers.get("transfer-encoding", "")) else b""

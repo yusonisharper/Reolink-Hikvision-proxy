@@ -6,7 +6,7 @@ import asyncio
 import logging
 import signal
 
-from . import hik
+from . import discovery, hik
 from .camera import VirtualCamera
 from .config import load
 from .session import BcSession
@@ -45,6 +45,13 @@ async def main_async(cfg_path: str, trace: bool | None) -> None:
 
         servers.append(await hik.listen_server(cfg.listen_host, cfg.listen_port, route))
         log.info("Hikvision HTTP push receiver on %s:%d", cfg.listen_host, cfg.listen_port)
+
+    if cfg.discovery and cams:
+        try:
+            servers.append(await discovery.serve(cams, *cfg.discovery))
+            log.info("Reolink LAN search responder on udp %s:%d", *cfg.discovery)
+        except OSError as e:
+            log.warning("LAN search disabled, cannot bind udp %s:%d: %s", *cfg.discovery, e)
 
     stop = asyncio.Event()
     loop = asyncio.get_running_loop()

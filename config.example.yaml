@@ -16,6 +16,10 @@ state_dir: ./state
 # NVR 发来但没有模板的"读"请求如何回复：ok(200) 或 error(400)
 unknown_reply: ok
 
+# 局域网搜索应答（NVR / Reolink Client 的“搜索设备”）：监听 UDP 2000，回复发到对方 UDP 3000。
+# 默认开启；false 关闭，或写成 192.168.1.200:2000 只在一个网卡上监听。
+# discovery: true
+
 # 可选：海康 "HTTP 监听/报警主机" 推送模式的接收端口（camera.hik.events = listen 时使用）
 # hik_listen: 0.0.0.0:8088
 
@@ -37,9 +41,10 @@ cameras:
     #   msg_ids: [112, 132]
     #   probe: false
     # display_name: 车道      # NVR/App 里显示的初始名称，默认用 name；在 NVR/App 里改名后以 state 为准
-    # uid: 95270000ABCDEFGH    # 不填则随机生成（每次重启会变，建议固定）
+    # uid: 95270000ABCDEFGH    # P2P UID。默认不填 = 只能用 IP 连接（App/NVR 用 UID 连会走 P2P，连不上）
+    # mac: EC:71:DB:12:34:56   # 局域网搜索结果里的 MAC；不填则由 name 生成，固定不变
     # serial: 00000000000000
-    # firmware: v3.1.0.2368_23062700
+    # firmware: v3.0.0.4308_2506201230
 
     hik:
       host: 192.168.1.64
@@ -51,6 +56,10 @@ cameras:
       main_rtsp: rtsp://admin:hik-password@192.168.1.64:554/Streaming/Channels/101
       sub_rtsp:  rtsp://admin:hik-password@192.168.1.64:554/Streaming/Channels/102
       snapshot_path: /ISAPI/Streaming/channels/101/picture
+      playback: true           # App/NVR 回放海康 SD 卡录像（海康无存储时自动关闭）
+      # playback_track: 101    # 海康录像轨道，101 = 主码流
+      audio: true              # 预览带声音（多一路 RTSP 和一个 ffmpeg 转码，观看时才运行）
+      light_seconds: 30        # App 手动开灯后，多少秒自动恢复
       events: alertstream      # alertstream(主动拉取) | listen(海康推送) | none
       # 跳过 ffprobe 自动探测（可选）:
       # main_info: {codec: H265, width: 3840, height: 2160, fps: 20}

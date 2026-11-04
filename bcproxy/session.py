@@ -2,17 +2,21 @@
 from __future__ import annotations
 
 import asyncio
+import datetime as dt
 import logging
 import os
 import time
 from string import Template
 
 from . import bc, bcmedia
+from . import playback as pb
+from . import hikcfg
 from . import settings as st
 from .bc import BcMsg, body_xml, ext_xml, xml_value
 from .camera import VirtualCamera
 from .crypto import Crypter, Enc, login_hash, make_aes_key
 from .events import Snapshot, alarm_event_xml
+from .media import read_access_units
 from .templates import SMART_MSG, smart_detect_xml
 
 log = logging.getLogger("bc")
@@ -21,7 +25,20 @@ MEDIA_CHUNK = 32 * 1024
 # Real cameras answer these with an empty 200 too (192: seen in a neolink capture;
 # 287: TimeCfg write from the app - Hikvision keeps its own NTP time).
 QUIET_OK = {192, 287}
+# What a real camera (dual-lens RLC, app capture) answers for features it lacks.
+ERROR_REPLY = {257: 400, 789: 405, 818: 405}
+# Read-only views of a setting that is written through another id: answer
+# with the template, overlaid with what the client stored (132 = 26 + ranges).
+READ_OVERLAY = {132: 26, 110: 44}
 SNAP_CHUNK = 32 * 1024
+MSG_ONLINE_USERS = 120
+MSG_RECORD_CFG, MSG_RECORD_CFG_SET, MSG_COMPRESSION_SET, MSG_RECORD, MSG_RECORD_SET = 54, 55, 57, 81, 82
+MSG_LIGHT_MANUAL, MSG_LIGHT_STATUS = 288, 291
+MSG_IMAGE_SET, MSG_IMAGE, MSG_IMAGE_RANGES, MSG_PORTS, MSG_PORTS_SET = 25, 26, 132, 37, 38
+CONTROL_IDS = {MSG_RECORD_CFG, MSG_RECORD_CFG_SET, MSG_COMPRESSION_SET, MSG_RECORD, MSG_RECORD_SET, MSG_LIGHT_MANUAL,
+               MSG_IMAGE_SET, MSG_IMAGE, MSG_IMAGE_RANGES, MSG_PORTS, MSG_PORTS_SET}
+PLAYBACK_IDS = {pb.MSG_HDD, pb.MSG_DAY_RECORDS, pb.MSG_FILE_OPEN, pb.MSG_FILE_LIST, pb.MSG_FILE_CLOSE,
+                pb.MSG_COVER, pb.MSG_REPLAY, pb.MSG_REPLAY_STOP}
 
 
 class BcSession:
@@ -38,6 +55,9 @@ class BcSession:
         self.username = ""
         self.alarm_req: BcMsg | None = None
         self.previews: dict[int, asyncio.Task] = {}
+        self.searches: dict[int, tuple[dt.datetime, dt.datetime, str]] = {}   # record search handles
+        self.next_handle = 0
+        self.replay: asyncio.Task | None = None
         self.tasks: set[asyncio.Task] = set()
         self.trace = trace
         self._wlock = asyncio.Lock()
@@ -107,6 +127,7 @@ class BcSession:
                 log.warning("%s: decoder skipped %d bytes (bad magic)", self.tag, self.decoder.skipped)
             log.info("%s: closing: %s (logged_in=%s)", self.tag, reason, self.logged_in)
             self.cam.alarm_subs.discard(self)
+            self.cam.sessions.discard(self)
             for t in list(self.previews.values()) + list(self.tasks):
                 t.cancel()
             self.writer.close()
@@ -126,9 +147,16 @@ class BcSession:
             bc.MSG_VIDEO_STOP: self.on_preview_stop,
             bc.MSG_ALARM_START: self.on_alarm_start,
             bc.MSG_SNAP: self.on_snap,
+            MSG_ONLINE_USERS: self.on_online_users,
         }.get(msg.msg_id)
         if handler:
             await handler(msg)
+            return
+        if self.cam.recordings and msg.msg_id in PLAYBACK_IDS:
+            await self.on_playback(msg)
+            return
+        if self.cam.hikcfg and msg.msg_id in CONTROL_IDS:
+            await self.on_control(msg)
             return
         if msg.msg_id in SMART_MSG and not self.cam.templates.has(msg.msg_id):
             stype = SMART_MSG[msg.msg_id]
@@ -150,6 +178,9 @@ class BcSession:
         payload = self._get_reply(msg.msg_id)
         if payload is not None:
             await self.send(msg.reply(200, payload=payload))
+            return
+        if msg.msg_id in ERROR_REPLY:
+            await self.send(msg.reply(ERROR_REPLY[msg.msg_id]))
             return
         if msg.msg_id in QUIET_OK:
             await self.send(msg.reply(200))
@@ -204,6 +235,7 @@ class BcSession:
             await self.send(msg.reply(400))
             return
         self.logged_in = True
+        self.cam.sessions.add(self)
         self.username = self.cam.cfg.username
         payload = self.cam.templates.render("login_deviceinfo", self.cam.template_vars(self.username))
         await self.send(msg.reply(200, payload=payload or b""))
@@ -217,6 +249,14 @@ class BcSession:
         """Reply body for a get message: stored setting > template."""
         tv = self.cam.template_vars(self.username)
         stored = self.cam.settings.get(msg_id)
+        if stored is None and msg_id in READ_OVERLAY:
+            over = self.cam.settings.get(READ_OVERLAY[msg_id])
+            base = self.cam.templates.render(msg_id, tv)
+            if over is not None and base is not None:
+                try:
+                    stored = st.merge(base, over)
+                except Exception:  # noqa: BLE001 - fall back to the plain template
+                    stored = None
         if stored is not None:
             return Template(stored.decode("utf-8")).safe_substitute(
                 {k: str(v) for k, v in tv.items()}).encode("utf-8")
@@ -237,6 +277,16 @@ class BcSession:
                  f" (name={new_name!r})" if new_name else "")
         await self.send(msg.reply(200))
 
+    async def on_online_users(self, msg: BcMsg) -> None:
+        users = "".join(
+            f"<OnlineUser>\n<userId>0</userId>\n<sessionId>{i}</sessionId>\n"
+            f"<userName>{s.username or self.cam.cfg.username}</userName>\n<userLevel>1</userLevel>\n"
+            f"<ipAddress>{s.peer[0] if s.peer else ''}</ipAddress>\n<macAddress></macAddress>\n"
+            f"<enableOutoffLine>0</enableOutoffLine>\n<isOnline>1</isOnline>\n</OnlineUser>\n"
+            for i, s in enumerate(sorted(self.cam.sessions, key=id), 1))
+        await self.send(msg.reply(200, payload=body_xml(
+            f'<OnlineUserList version="1.1">\n{users}</OnlineUserList>')))
+
     async def on_logout(self, msg: BcMsg) -> None:
         await self.send(msg.reply(200))
         self.writer.close()
@@ -248,6 +298,62 @@ class BcSession:
         await self.send(msg.reply(200))
         log.info("%s: alarm subscription started", self.tag)
         self.push_alarm(self.cam.state.snapshot())
+        if self.cam.hikcfg and self.cam.hikcfg.light_on_mode:
+            self.push_light(self.cam.light_status)
+
+    def push_light(self, on: bool) -> None:
+        if self.writer.is_closing():
+            return
+        self._spawn(self.send(BcMsg(MSG_LIGHT_STATUS, response=200, payload=body_xml(
+            '<FloodlightStatusList version="1.1">\n<FloodlightStatus>\n<channel>0</channel>\n'
+            f"<status>{1 if on else 0}</status>\n</FloodlightStatus>\n</FloodlightStatusList>"))))
+
+    # ------------------------------------------------- settings that reach Hikvision
+    async def on_control(self, msg: BcMsg) -> None:
+        mid, cfg = msg.msg_id, self.cam.hikcfg
+        try:
+            if mid == MSG_COMPRESSION_SET:
+                await self.cam.apply_compression(msg.payload)
+                await self.send(msg.reply(200))
+            elif mid == MSG_LIGHT_MANUAL:
+                await self.cam.set_light(xml_value(msg.payload, "status") == "1")
+                await self.send(msg.reply(200))
+            elif mid in (MSG_IMAGE, MSG_IMAGE_RANGES):
+                template = self.cam.templates.render(MSG_IMAGE_RANGES, self.cam.template_vars(self.username))
+                await self.send(msg.reply(200, payload=await cfg.image_xml(template, self.cam.frame_rate_mode)))
+            elif mid == MSG_IMAGE_SET:
+                changed = await cfg.apply_image(msg.payload)
+                log.info("%s: image written to Hikvision: %s", self.tag, changed or "no change")
+                rate = xml_value(msg.payload, "constantFrameRate")
+                if rate is not None:
+                    self.cam.set_frame_rate_mode(int(rate))
+                await self.send(msg.reply(200))
+            elif mid == MSG_PORTS:
+                await self.send(msg.reply(200, payload=body_xml(await cfg.server_ports_xml(self.cam.cfg.listen_port))))
+            elif mid == MSG_PORTS_SET:
+                changed = await cfg.set_server_ports(msg.payload, self.cam.cfg.listen_port)
+                log.info("%s: server ports written to Hikvision: %s", self.tag, changed or "no change")
+                await self.send(msg.reply(200))
+            elif mid == MSG_RECORD:
+                doc = self.cam.settings.get(MSG_RECORD) or body_xml(hikcfg.record_xml(
+                    await cfg.track(), [t for t in ("people", "vehicle", "dog_cat") if t in self.cam.cfg.ai_types]))
+                await self.send(msg.reply(200, payload=doc))
+            elif mid == MSG_RECORD_SET:
+                root = st._body(msg.payload).find("Record")
+                tables = {i.findtext("type"): i.findtext("valueTable") or "" for i in root.iter("item")}
+                await cfg.set_schedule(root.findtext("enable") != "0", tables)
+                self.cam.settings.put(MSG_RECORD, msg.payload)
+                log.info("%s: record schedule written to Hikvision", self.tag)
+                await self.send(msg.reply(200))
+            elif mid == MSG_RECORD_CFG:
+                await self.send(msg.reply(200, payload=body_xml(await cfg.record_cfg_xml())))
+            else:   # MSG_RECORD_CFG_SET
+                num = lambda t: int(v) if (v := xml_value(msg.payload, t)) else None  # noqa: E731
+                await cfg.set_record_cfg(num("cycle"), num("recordDelayTime"), num("preRecordTime"))
+                await self.send(msg.reply(200))
+        except Exception as e:  # noqa: BLE001 - Hikvision refused, bad request: tell the app
+            log.warning("%s: msg %d failed: %s", self.tag, mid, e)
+            await self.send(msg.reply(400))
 
     # ---------------------------------------------------------------- video
     async def on_preview(self, msg: BcMsg) -> None:
@@ -279,6 +385,7 @@ class BcSession:
         log.info("%s: preview %s started", self.tag, stype)
         frames = sent = 0
         t_start = time.monotonic()
+        audio_task = None
         try:
             first = bcmedia.info_v2(info.width, info.height, info.fps)
             await self.send(req.reply(200, ext=ext_xml(binaryData=1), payload=first, binary=True))
@@ -293,8 +400,14 @@ class BcSession:
                 if waiting_key and not au.keyframe:
                     continue
                 waiting_key = False
+                if src.info is not info and src.info:    # resolution changed from the settings page
+                    info = src.info
+                    await self.send(req.reply(200, payload=bcmedia.info_v2(info.width, info.height, info.fps),
+                                              binary=True))
                 if t0 is None:
                     t0 = ts
+                    if self.cam.audio and self.cam.audio_on:
+                        audio_task = self._spawn(self._audio(req))
                 micros = int((ts - t0) * 1_000_000)
                 frame = (bcmedia.iframe(info.codec, au.data, micros, int(time.time()))
                          if au.keyframe else bcmedia.pframe(info.codec, au.data, micros))
@@ -310,9 +423,128 @@ class BcSession:
         except (ConnectionError, OSError) as e:
             log.info("%s: preview %s ended: %s", self.tag, stype, e)
         finally:
+            if audio_task:
+                audio_task.cancel()
             src.unsubscribe(q)
             log.info("%s: preview %s stopped after %.1fs: %d frames, %d KB", self.tag, stype,
                      time.monotonic() - t_start, frames, sent // 1024)
+
+    async def _audio(self, req: BcMsg) -> None:
+        """Microphone frames, interleaved with the video of one preview request."""
+        q = self.cam.audio.subscribe()
+        try:
+            while True:
+                await self.send(req.reply(200, payload=bcmedia.aac(await q.get()), binary=True))
+        except (ConnectionError, OSError):
+            pass
+        finally:
+            self.cam.audio.unsubscribe(q)
+
+    # ------------------------------------------------------------- playback
+    async def on_playback(self, msg: BcMsg) -> None:
+        rec, mid = self.cam.recordings, msg.msg_id
+        try:
+            if mid == pb.MSG_HDD:
+                cap = await rec.storage()
+                if cap is None:
+                    raise ValueError("no disk")
+                await self.send(msg.reply(200, payload=body_xml(pb.hdd_info_xml(*cap))))
+            elif mid == pb.MSG_DAY_RECORDS:
+                el = pb.body_root(msg.payload, "DayRecords")
+                start, end = pb.parse_time(el.find("startTime")), pb.parse_time(el.find("endTime"))
+                days = [dt.date(y, m, d) for y, m in pb.months_between(start.date(), end.date())
+                        for d in sorted(await rec.record_days(y, m))
+                        if start.date() <= dt.date(y, m, d) <= end.date()]
+                await self.send(msg.reply(200, payload=body_xml(pb.day_records_xml(start, end, days))))
+            elif mid == pb.MSG_FILE_OPEN:
+                el = pb.body_root(msg.payload, "FileInfo")
+                start, end = pb.parse_time(el.find("startTime")), pb.parse_time(el.find("endTime"))
+                if not start or not end:
+                    raise ValueError("no time range")
+                self.next_handle += 1
+                self.searches[self.next_handle] = (start, end, el.findtext("streamType") or "mainStream")
+                await self.send(msg.reply(200, payload=body_xml(pb.file_open_xml(self.next_handle, start, end))))
+            elif mid == pb.MSG_FILE_LIST:
+                handle = int(xml_value(msg.payload, "handle") or -1)
+                if handle not in self.searches:
+                    raise ValueError(f"unknown handle {handle}")
+                start, end, stream = self.searches[handle]
+                found = await rec.search(start, end)
+                segs = pb.merge_segments([pb.Segment(s.start, s.end, self.cam.journal.label(s)) for s in found],
+                                         start, end)
+                log.info("%s: record search %s .. %s: %d segment(s), listed as %d", self.tag, start, end,
+                         len(found), len(segs))
+                await self.send(msg.reply(200, payload=body_xml(pb.file_list_xml(handle, stream, segs))))
+            elif mid == pb.MSG_FILE_CLOSE:
+                self.searches.pop(int(xml_value(msg.payload, "handle") or -1), None)
+                await self.send(msg.reply(200))
+            elif mid == pb.MSG_REPLAY:
+                self._stop_replay()
+                self.replay = self._spawn(self._replay(msg))
+            elif mid == pb.MSG_REPLAY_STOP:
+                self._stop_replay()
+                await self.send(msg.reply(200))
+            else:   # 298 timeline thumbnails
+                await self.send(msg.reply(400))
+        except Exception as e:  # noqa: BLE001 - Hikvision errors, bad requests
+            log.warning("%s: playback msg %d failed: %s", self.tag, mid, e)
+            await self.send(msg.reply(400))
+
+    def _stop_replay(self) -> None:
+        if self.replay and not self.replay.done():
+            self.replay.cancel()
+        self.replay = None
+
+    async def _replay(self, req: BcMsg) -> None:
+        rec = self.cam.recordings
+        seq = pb.seq_of(req.payload)
+        el = pb.body_root(req.payload, "ReplayByTimeV2")
+        start = pb.parse_time(el.find("startTime")) if el is not None else None
+        end = pb.parse_time(el.find("endTime")) if el is not None else None
+        stream = (el.findtext("streamType") if el is not None else None) or "mainStream"
+        try:
+            if not start or not end:
+                raise ValueError("no time range")
+            info = await self.cam.main.ensure_info()
+            segs = await rec.search(start, end, limit=1)
+            if not segs:
+                raise ValueError(f"no recording after {start}")
+            begin = max(start, segs[0].start)
+        except Exception as e:  # noqa: BLE001
+            log.warning("%s: replay failed: %s", self.tag, e)
+            await self.send(req.reply(400))
+            return
+        await self.send(req.reply(200))
+        await self.send(req.reply(200, ext=ext_xml(channelId=0), payload=body_xml(
+            pb.replay_info_xml(seq, stream, info.width, info.height, info.fps, begin, segs[0].end))))
+        url = await rec.replay_url(self.cam.cfg.main_rtsp, begin, end)
+        ext = ext_xml(binaryData=1, channelId=0)
+        log.info("%s: replay from %s (seq %d)", self.tag, begin, seq)
+        frames = sent = 0
+        t0 = time.monotonic()
+        aus = read_access_units(url, info.codec)
+        try:
+            async for au in aus:
+                if frames == 0 and not au.keyframe:
+                    continue
+                micros = int((time.monotonic() - t0) * 1_000_000)
+                wall = pb.wall_seconds(begin + dt.timedelta(microseconds=micros))
+                frame = (bcmedia.iframe(info.codec, au.data, micros, wall) if au.keyframe
+                         else bcmedia.pframe(info.codec, au.data, micros))
+                for i in range(0, len(frame), MEDIA_CHUNK):
+                    # replay frames carry the session seq where replies have response/class
+                    await self.send(BcMsg(pb.MSG_REPLAY, req.channel, req.stream_type, req.msg_num,
+                                          seq & 0xFFFF, seq >> 16, ext, frame[i:i + MEDIA_CHUNK], True))
+                frames += 1
+                sent += len(frame)
+        except asyncio.CancelledError:
+            pass
+        except (ConnectionError, OSError) as e:
+            log.info("%s: replay ended: %s", self.tag, e)
+        finally:
+            await aus.aclose()      # kills ffmpeg now, not at garbage collection
+            log.info("%s: replay stopped after %.1fs: %d frames, %d KB", self.tag,
+                     time.monotonic() - t0, frames, sent // 1024)
 
     # ------------------------------------------------------------- snapshot
     async def on_snap(self, msg: BcMsg) -> None:

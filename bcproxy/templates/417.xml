@@ -1,0 +1,20 @@
+<BinoStitch version="1.1">
+<distance>
+<min>2</min>
+<max>20</max>
+<cur>8</cur>
+<def>8</def>
+</distance>
+<xpixel>
+<min>-100</min>
+<max>100</max>
+<cur>0</cur>
+<def>0</def>
+</xpixel>
+<ypixel>
+<min>-100</min>
+<max>100</max>
+<cur>0</cur>
+<def>0</def>
+</ypixel>
+</BinoStitch>

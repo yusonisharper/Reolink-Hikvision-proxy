@@ -1,0 +1,17 @@
+<Email version="1.1">
+<smtpServer>smtp.gmail.com</smtpServer>
+<userName></userName>
+<senderMaxLen>127</senderMaxLen>
+<password></password>
+<pwdMaxLen>127</pwdMaxLen>
+<address1></address1>
+<address2></address2>
+<address3></address3>
+<sendNickname></sendNickname>
+<smtpPort>465</smtpPort>
+<attachment>1</attachment>
+<attachmentType>picture</attachmentType>
+<textType>withText</textType>
+<ssl>1</ssl>
+<interval>30</interval>
+</Email>

@@ -1,0 +1,17 @@
+<FloodlightTask version="1.1">
+<channel>0</channel>
+<alarmMode>0</alarmMode>
+<enable>0</enable>
+<preview_auto>0</preview_auto>
+<duration>${light_seconds}</duration>
+<brightness_cur>100</brightness_cur>
+<brightness_max>100</brightness_max>
+<brightness_min>1</brightness_min>
+<schedule>
+<startHour>18</startHour>
+<startMin>0</startMin>
+<endHour>6</endHour>
+<endMin>0</endMin>
+</schedule>
+<detectType>people</detectType>
+</FloodlightTask>

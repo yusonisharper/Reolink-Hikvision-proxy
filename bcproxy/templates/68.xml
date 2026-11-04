@@ -1,0 +1,25 @@
+<Ftp version="1.1">
+<server></server>
+<port>21</port>
+<nonymous>0</nonymous>
+<remoteDir></remoteDir>
+<userName></userName>
+<password></password>
+<pwdMaxLen>127</pwdMaxLen>
+<fileLen>100</fileLen>
+<supportTest>1</supportTest>
+<streamType>0</streamType>
+<ftpVersion>1</ftpVersion>
+<intervals>15</intervals>
+<mode>0</mode>
+<autoDir>1</autoDir>
+<picPolicy>0</picPolicy>
+<picName></picName>
+<picType>0</picType>
+<picHeight>1552</picHeight>
+<picWidth>5120</picWidth>
+<picIntervals>60</picIntervals>
+<videoPolicy>0</videoPolicy>
+<videoName></videoName>
+<onlyFtps>1</onlyFtps>
+</Ftp>

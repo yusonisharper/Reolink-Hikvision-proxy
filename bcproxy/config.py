@@ -20,6 +20,7 @@ class AppConfig:
     trace: bool = False
     listen_host: str = "0.0.0.0"
     listen_port: int | None = None    # Hikvision HTTP push receiver
+    discovery: tuple[str, int] | None = ("0.0.0.0", 2000)   # Reolink LAN search responder
     extra: dict = field(default_factory=dict)
 
 
@@ -63,7 +64,7 @@ def load(path: str) -> AppConfig:
             sync_name_to_hik=bool(hik.get("sync_name", True)),
             perf_msg_ids=tuple(int(x) for x in (c.get("performance") or {}).get("msg_ids", [])),
             perf_probe=bool((c.get("performance") or {}).get("probe", False)),
-            **{k: str(c[k]) for k in ("model", "hardware", "firmware", "build_day", "detail", "serial", "uid")
+            **{k: str(c[k]) for k in ("model", "hardware", "firmware", "build_day", "detail", "serial", "uid", "mac")
                if k in c},
             hik_host=hik.get("host", ""), hik_port=int(hik.get("port", 80)),
             hik_user=hik.get("username", "admin"), hik_password=str(hik.get("password", "")),
@@ -71,6 +72,8 @@ def load(path: str) -> AppConfig:
             main_rtsp=hik.get("main_rtsp", ""), sub_rtsp=hik.get("sub_rtsp", ""),
             snapshot_path=hik.get("snapshot_path", "/ISAPI/Streaming/channels/101/picture"),
             event_source=hik.get("events", "alertstream"),
+            playback=bool(hik.get("playback", True)), playback_track=int(hik.get("playback_track", 101)),
+            audio=bool(hik.get("audio", True)), light_seconds=int(hik.get("light_seconds", 30)),
             ai_types=ai_types, smart_zones=smart,
             holds=Holds(motion=float(hold.get("motion", 3)), ai=float(hold.get("ai", 5)),
                         smart=float(hold.get("smart", 5))),
@@ -83,11 +86,13 @@ def load(path: str) -> AppConfig:
     lh, lp = (None, None)
     if raw.get("hik_listen"):
         lh, lp = _hostport(str(raw["hik_listen"]), 8088)
+    disc = raw.get("discovery", True)
+    discovery = None if disc is False else _hostport("0.0.0.0" if disc is True else str(disc), 2000)
     unknown = raw.get("unknown_reply", "ok")
     return AppConfig(
         cameras=cams, templates_dir=raw.get("templates_dir"),
         state_dir=raw.get("state_dir", "state") or None,
         unknown_reply=200 if unknown in ("ok", 200) else 400,
         log_level=raw.get("log_level", "info"), trace=bool(raw.get("trace", False)),
-        listen_host=lh or "0.0.0.0", listen_port=lp,
+        listen_host=lh or "0.0.0.0", listen_port=lp, discovery=discovery,
     )

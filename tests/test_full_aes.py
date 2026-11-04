@@ -7,7 +7,7 @@ from bcproxy import bc
 from bcproxy.bc import BcMsg, ext_xml, xml_value
 from bcproxy.bcmedia import AccessUnit
 from bcproxy.camera import CameraConfig, VirtualCamera
-from bcproxy.crypto import Crypter, Enc, aes_decrypt, make_aes_key
+from bcproxy.crypto import Crypter, Enc, aes_decrypt, aes_encrypt, make_aes_key
 from bcproxy.media import StreamInfo
 from bcproxy.session import BcSession
 
@@ -156,3 +156,44 @@ def test_nvr_reverse_magic_is_echoed():
     assert hdr[:4] == bytes.fromhex("a0cbed0f")
     assert hdr[14:16] == bytes.fromhex("009b") and hdr[16:18] == bytes.fromhex("12dd")
     assert rep.response == 200 and b"<Support" in rep.payload
+
+
+def test_binary_mode_is_per_request_id():
+    """The app keeps num=0 and counts in the channel/stream bytes: a binary
+    stream on one request must not turn the next request into binary."""
+    tx, rx = Crypter(), Crypter()
+    tx.set(Enc.FULL_AES, KEY)
+    rx.set(Enc.FULL_AES, KEY)
+    talk = bc.encode(BcMsg(202, 9, 0, 0, 0, bc.CLASS_MODERN_REQ, ext_xml(binaryData=1), b"\x01" * 50, True), tx)
+    xml = b'<?xml version="1.0" encoding="UTF-8" ?>\n<body><X/></body>\n'
+    nxt = bc.encode(BcMsg(14, 10, 0, 0, 0, bc.CLASS_MODERN_REQ, b"", xml), tx)
+    d = bc.Decoder(rx)
+    d.feed(talk + nxt)
+    m1, m2 = list(d.messages())
+    assert m1.binary and not m2.binary and m2.payload == xml
+
+
+def test_replay_frame_header_carries_seq():
+    """Replay data (msg 381) puts the session seq in the response/class bytes,
+    still with a 24-byte header; real cameras spell it <EncryptLen>."""
+    seq = 1793605341
+    tx, rx = Crypter(), Crypter()
+    tx.set(Enc.FULL_AES, KEY)
+    rx.set(Enc.FULL_AES, KEY)
+    data = b"00dcH264" + bytes(range(256)) * 8
+    frame = bc.encode(BcMsg(381, 35, 0, 0, seq & 0xFFFF, seq >> 16, ext_xml(binaryData=1), data, True), tx)
+    assert bc.has_offset(seq >> 16) and len(frame) > 24
+    d = bc.Decoder(rx)
+    d.feed(frame + frame)
+    msgs = list(d.messages())
+    assert len(msgs) == 2 and d.skipped == 0
+    assert msgs[0].payload == data and (msgs[0].cls << 16 | msgs[0].response) == seq
+    # capital E variant (as sent by real cameras)
+    ext = ext_xml(binaryData=1).replace(b"</Extension>", b"<EncryptLen>16</EncryptLen>\n</Extension>")
+    enc_ext = tx.encrypt(381, 0, ext)
+    body = enc_ext + aes_encrypt(KEY, data[:16]) + data[16:]
+    raw = bc.HDR.pack(bc.MAGIC, 381, len(body), 1, 0, 0, seq & 0xFFFF, seq >> 16) + len(enc_ext).to_bytes(4, "little")
+    d2 = bc.Decoder(rx)
+    d2.feed(raw + body)
+    (m,) = list(d2.messages())
+    assert m.binary and m.payload == data

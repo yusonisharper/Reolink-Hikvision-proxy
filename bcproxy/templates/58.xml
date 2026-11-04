@@ -2,23 +2,22 @@
 <userName>${username}</userName>
 <system>1</system>
 <streaming>1</streaming>
-<record>0</record>
+<record>${disk_num}</record>
 <network>1</network>
 <PTZ>0</PTZ>
 <IO>0</IO>
 <alarm>1</alarm>
 <image>1</image>
 <video>1</video>
-<audio>0</audio>
+<audio>1</audio>
 <security>1</security>
-<replay>0</replay>
-<disk>0</disk>
+<replay>${disk_num}</replay>
+<disk>${disk_num}</disk>
 </AbilitySuppport>
 <UserList version="1.1">
 <User>
 <userId>0</userId>
 <userName>${username}</userName>
-<password></password>
 <userLevel>1</userLevel>
 <loginState>1</loginState>
 <userSetState>none</userSetState>

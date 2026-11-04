@@ -43,7 +43,9 @@ MSG_SNAP = 109
 
 
 def has_offset(cls: int) -> bool:
-    return cls in (CLASS_MODERN_REQ, CLASS_MODERN)
+    # Replay data frames (msg 381) carry the session <seq> (u32) in the
+    # response/class bytes, with a 24-byte header: anything unknown has one.
+    return cls not in (CLASS_LEGACY, CLASS_MODERN_NOOFF)
 
 
 @dataclass
@@ -134,7 +136,9 @@ class Decoder:
     def __init__(self, crypter: Crypter) -> None:
         self.crypter = crypter
         self.buf = bytearray()
-        self.binary_nums: set[int] = set()
+        # Binary mode is per request. Key on all 4 id bytes (ch, stream, num): the
+        # Reolink app keeps num=0 and counts in the first byte instead.
+        self.binary_ids: set[tuple[int, int, int]] = set()
         self.skipped = 0          # bytes thrown away while resyncing on magic
         self.magic: int | None = None   # magic of the first valid message (echo it back)
 
@@ -187,13 +191,14 @@ class Decoder:
             return msg
         msg.ext = self.crypter.decrypt(msg_id, ch, ext_raw)
         bd = xml_value(msg.ext, "binaryData")
+        rid = (ch, st, num)
         if bd == "1":
-            self.binary_nums.add(num)
+            self.binary_ids.add(rid)
         elif bd == "0":
-            self.binary_nums.discard(num)
-        if num in self.binary_nums and msg_id != MSG_LOGIN:
+            self.binary_ids.discard(rid)
+        if rid in self.binary_ids and msg_id != MSG_LOGIN:
             msg.binary = True
-            enc_len = xml_value(msg.ext, "encryptLen")
+            enc_len = xml_value(msg.ext, "encryptLen") or xml_value(msg.ext, "EncryptLen")  # real cams: "E"
             if enc_len is not None and self.crypter.full_aes:
                 n = int(enc_len)
                 msg.payload = self.crypter.decrypt(msg_id, ch, pay_raw[:n]) + pay_raw[n:]

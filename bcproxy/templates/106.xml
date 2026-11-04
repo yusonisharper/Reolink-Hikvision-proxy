@@ -1,0 +1,17 @@
+<Dst version="1.1">
+<enable>1</enable>
+<offset>1</offset>
+<startMonth>3</startMonth>
+<startWeekIndex>2</startWeekIndex>
+<startWeekday>Sunday</startWeekday>
+<startHour>2</startHour>
+<startMinute>0</startMinute>
+<startSecond>0</startSecond>
+<endMonth>11</endMonth>
+<endWeekIndex>1</endWeekIndex>
+<endWeekday>Sunday</endWeekday>
+<endHour>2</endHour>
+<endMinute>0</endMinute>
+<endSecond>0</endSecond>
+<version>1</version>
+</Dst>

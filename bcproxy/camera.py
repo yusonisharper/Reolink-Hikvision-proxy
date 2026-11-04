@@ -9,15 +9,19 @@ import time
 from dataclasses import dataclass, field
 from xml.sax.saxutils import escape as xml_escape
 
-from . import hik
-from .bc import body_xml
+from . import discovery, hik
+from . import settings as st
+from .bc import body_xml, xml_value
 from .events import AI_TYPES, SMART_TYPES, DetEvent, EventState, Holds, Snapshot
-from .media import RateMeter, StreamInfo, StreamSource
+from .hikcfg import HikConfig
+from .media import AudioSource, RateMeter, StreamInfo, StreamSource
+from .playback import EventJournal, HikRecordings
 from .settings import SettingsStore
 from .templates import Templates
 
 log = logging.getLogger("camera")
 
+FRAME_RATE_MODE_KEY = 25      # settings store slot (write id of the image page)
 AITYPE_BITS = {"people": 1 << 1, "vehicle": 1 << 2, "face": 1 << 3, "dog_cat": 1 << 4}
 SMART_BITS = {"crossline": 1 << 1, "intrusion": 1 << 2, "loitering": 1 << 3}
 
@@ -36,12 +40,13 @@ class CameraConfig:
     perf_msg_ids: tuple = ()           # msg ids answered with <Performance> (experimental, see README)
     perf_probe: bool = False           # answer each id with marker values to find the right one
     model: str = "RLC-811A"
-    hardware: str = "IPC_523128M8MP"
-    firmware: str = "v3.1.0.2368_23062700"
-    build_day: str = "23062700"
-    detail: str = "IPC_523128M8MP0000000000000"
+    hardware: str = "IPC_NT7NA58MP"
+    firmware: str = "v3.0.0.4308_2506201230"
+    build_day: str = "2506201230"
+    detail: str = "IPC_NT7NA58MPS35E1W01100000001"
     serial: str = ""
-    uid: str = ""
+    uid: str = ""                      # P2P UID; empty (default) = IP-only, like a camera with P2P off
+    mac: str = ""                      # MAC in LAN search replies (default: derived from name)
     # Hikvision
     hik_host: str = ""
     hik_port: int = 80
@@ -52,6 +57,10 @@ class CameraConfig:
     sub_rtsp: str = ""
     snapshot_path: str = "/ISAPI/Streaming/channels/101/picture"
     event_source: str = "alertstream"  # alertstream | listen | none
+    playback: bool = True              # serve the Hikvision SD card recordings to the app/NVR
+    playback_track: int = 101          # Hikvision record track (101 = main stream)
+    audio: bool = True                 # forward the microphone (main stream audio, AAC transcoded)
+    light_seconds: int = 30            # the manual light switches itself off after this long
     # events
     ai_types: list[str] = field(default_factory=lambda: ["people", "vehicle"])
     smart_zones: dict[str, list[dict]] = field(default_factory=dict)
@@ -65,6 +74,12 @@ class CameraConfig:
     main_info: StreamInfo | None = None
     sub_info: StreamInfo | None = None
 
+
+# 151 <AbilityInfo> block that makes the app offer playback (from a real camera)
+RECORD_ABILITY = ("<record>\n<subModule>\n<channelId>0</channelId>\n"
+                  "<abilityValue>download_rw, fileFind_rw, recordCfg_rw, recordSchedule_rw, subStreamRecord_ro"
+                  "</abilityValue>\n"
+                  "</subModule>\n</record>\n")
 
 # Reolink-style option lists; the current value is always merged in.
 FPS_TABLE = [30, 25, 22, 20, 18, 16, 15, 12, 10, 8, 6, 4, 2]
@@ -85,6 +100,15 @@ def _table(values: list[int], cur: int, limit: int | None = None) -> str:
     return ",".join(str(v) for v in sorted(vals, reverse=values[0] > values[-1]))
 
 
+def _encode_table(stype: str, venc: int, size: tuple[int, int], fps: int, kbps: int,
+                  fps_table: str, kbps_table: str, gop: int) -> str:
+    return (f"<encodeTable>\n<type>{stype}</type>\n<videoEncType>{venc}</videoEncType>\n"
+            f"<resolution>\n<width>{size[0]}</width>\n<height>{size[1]}</height>\n</resolution>\n"
+            f"<defaultFramerate>{fps}</defaultFramerate>\n<defaultBitrate>{kbps}</defaultBitrate>\n"
+            f"<framerateTable>{fps_table}</framerateTable>\n<bitrateTable>{kbps_table}</bitrateTable>\n"
+            f"<defaultGop>{gop}</defaultGop>\n</encodeTable>\n")
+
+
 class VirtualCamera:
     def __init__(self, cfg: CameraConfig, templates_dir: str | None = None,
                  unknown_reply: int = 200, state_dir: str | None = None) -> None:
@@ -101,12 +125,23 @@ class VirtualCamera:
         self.mapper = hik.EventMapper(untargeted_smart_target=cfg.untargeted_smart_target,
                                       channel=cfg.hik_channel, region_base=cfg.region_base, **mapper_kw)
         self.http = hik.HikHttp(cfg.hik_host, cfg.hik_port, cfg.hik_user, cfg.hik_password) if cfg.hik_host else None
-        self.main = StreamSource(f"{cfg.name}/main", cfg.main_rtsp, cfg.main_info) if cfg.main_rtsp else None
+        self.hikcfg = HikConfig(self.http, cfg.hik_channel) if self.http else None
+        self.audio = AudioSource(f"{cfg.name}/audio", cfg.main_rtsp) if cfg.audio and cfg.main_rtsp else None
+        self.audio_on = False               # Hikvision main stream carries audio
+        self.light_status = False
+        self._light_restore = "close"
+        self._light_task: asyncio.Task | None = None
+        self.main =StreamSource(f"{cfg.name}/main", cfg.main_rtsp, cfg.main_info) if cfg.main_rtsp else None
         self.sub = StreamSource(f"{cfg.name}/sub", cfg.sub_rtsp or cfg.main_rtsp, cfg.sub_info) \
             if (cfg.sub_rtsp or cfg.main_rtsp) else None
+        self.recordings = HikRecordings(self.http, cfg.playback_track) \
+            if self.http and cfg.playback and cfg.main_rtsp else None
+        # detections with time, to label playback files people/vehicle/...
+        self.journal = EventJournal(self.settings.dir / "events.jsonl" if self.settings.dir else None)
         self.alarm_subs: set = set()        # BcSession objects
+        self.sessions: set = set()          # all logged-in BcSessions (msg 120 online users)
         self.last_snapshot = Snapshot()
-        self.uid = cfg.uid or ("9527" + os.urandom(6).hex().upper())
+        self.uid = cfg.uid
         self.serial = cfg.serial or os.urandom(7).hex().upper()
         self._tasks: list[asyncio.Task] = []
         self.tx = RateMeter()               # bytes sent to NVR/app (all sessions)
@@ -121,16 +156,149 @@ class VirtualCamera:
                 try:
                     await src.ensure_info()
                 except Exception as e:  # noqa: BLE001 - keep running, NVR may still connect
-                    log.warning("%s: probe %s failed: %s", self.cfg.name, src.url, e)
+                    log.warning("%s: probe of %s failed: %s", self.cfg.name, src.name, e or type(e).__name__)
+        if self.hikcfg and not await self._load_hik():
+            # Hikvision rebooting or unreachable: don't lose playback, light and sizes until our restart
+            log.warning("%s: Hikvision not reachable, will keep trying", self.cfg.name)
+            self._tasks.append(asyncio.create_task(self._retry_load_hik()))
         if self.cfg.event_source == "alertstream" and self.http:
             self._tasks.append(asyncio.create_task(hik.alert_stream(self.http, self.on_alert)))
         self._tasks.append(asyncio.create_task(self._ticker()))
         if self.http:
             self._tasks.append(asyncio.create_task(self._poll_status()))
 
+    async def _load_hik(self) -> bool:
+        """What this Hikvision camera offers. False when it could not be asked."""
+        try:
+            if self.recordings:
+                disk = await self.recordings.storage()
+                if disk is None:
+                    log.info("%s: playback off (no SD card / HDD)", self.cfg.name)
+                    self.recordings = None
+                else:
+                    log.info("%s: playback from Hikvision storage (%d of %d MB free)", self.cfg.name,
+                             disk[1], disk[0])
+            await self.hikcfg.load()
+            self.audio_on = bool(self.audio) and await self.hikcfg.audio_enabled()
+            if self.hikcfg.light_on_mode:
+                self.light_status = await self.hikcfg.light_mode() == self.hikcfg.light_on_mode
+        except (OSError, asyncio.TimeoutError) as e:
+            log.debug("%s: Hikvision capabilities: %s", self.cfg.name, e)
+            return False
+        except Exception as e:  # noqa: BLE001 - keep running without these features
+            log.warning("%s: Hikvision capabilities: %s", self.cfg.name, e)
+        log.info("%s: streams %s, audio %s, light %s", self.cfg.name,
+                 {k: v.sizes for k, v in self.hikcfg.caps.items()}, "on" if self.audio_on else "off",
+                 self.hikcfg.light_on_mode or "none")
+        return True
+
+    async def _retry_load_hik(self, interval: float = 30) -> None:
+        while not await self._load_hik():
+            await asyncio.sleep(interval)
+
     async def stop(self) -> None:
         for t in self._tasks:
             t.cancel()
+        if self._light_task:      # don't leave a timed light burning without its timer
+            try:
+                await self.set_light(False)
+            except Exception as e:  # noqa: BLE001
+                log.warning("%s: could not switch the light off: %s", self.cfg.name, e)
+
+    # ------------------------------------------------------------------ light
+    async def set_light(self, on: bool) -> None:
+        """Manual light from the preview page; goes back to its previous mode by itself."""
+        if not self.hikcfg or not self.hikcfg.light_on_mode:
+            raise ValueError("no light on this camera")
+        task, self._light_task = self._light_task, None
+        if task and task is not asyncio.current_task():
+            task.cancel()
+        if on:
+            mode = await self.hikcfg.light_mode()
+            if mode != self.hikcfg.light_on_mode:
+                self._light_restore = mode
+                await self.hikcfg.set_light_mode(self.hikcfg.light_on_mode)
+            self._light_task = asyncio.create_task(self._light_timer())
+        else:
+            await self.hikcfg.set_light_mode(self._light_restore)
+        log.info("%s: light %s", self.cfg.name, f"on for {self.cfg.light_seconds} s" if on else "off")
+        self.light_status = on
+        for s in list(self.sessions):
+            s.push_light(on)
+
+    async def _light_timer(self) -> None:
+        await asyncio.sleep(self.cfg.light_seconds)
+        try:
+            await self.set_light(False)
+        except Exception as e:  # noqa: BLE001
+            log.warning("%s: could not switch the light off: %s", self.cfg.name, e)
+
+    # ---------------------------------------------------------------- streams
+    def stream_info_list(self) -> str:
+        """146: one <StreamInfo> per main size, like real cameras: the sub stream size is
+        fixed (the Reolink app does not offer changing it), so only the current one is listed."""
+        mi = (self.main.info if self.main and self.main.info else None) or StreamInfo()
+        si = (self.sub.info if self.sub and self.sub.info else None) or StreamInfo(width=640, height=360, fps=15)
+        caps = self.hikcfg.caps if self.hikcfg else {}
+        tables = []
+        for idx, stype, info, kbps, rates in ((1, "mainStream", mi, self.hik_bitrate or 4096, MAIN_KBPS),
+                                              (2, "subStream", si, self.hik_sub_bitrate or 512, SUB_KBPS)):
+            c = caps.get(idx)
+            sizes = sorted(set(c.sizes if c and idx == 1 else []) | {(info.width, info.height)}, reverse=True)
+            venc = 1 if info.codec == "H265" else 0
+            fps_t = _table(FPS_TABLE, info.fps, c.max_fps if c else max(info.fps, 2))
+            kbps_t = _table(rates, kbps, c.max_kbps if c else None)
+            gop = 2 if idx == 1 else 4
+            tables.append([_encode_table(stype, venc, s, info.fps, kbps, fps_t, kbps_t, gop) for s in sizes])
+        subs = "".join(tables[1])
+        infos = "".join(f"<StreamInfo>\n<channelBits>1</channelBits>\n{m}{subs}</StreamInfo>\n" for m in tables[0])
+        return f'<StreamInfoList version="1.1">\n{infos}</StreamInfoList>'
+
+    @property
+    def frame_rate_mode(self) -> int:
+        """Image page "frame rate mode" (constantFrameRate). Hikvision has no such setting,
+        so it is only remembered here; CBR/VBR is the stream page's bitrate mode."""
+        doc = self.settings.get(FRAME_RATE_MODE_KEY)
+        value = xml_value(doc, "constantFrameRate") if doc else None
+        return int(value) if value else 0
+
+    def set_frame_rate_mode(self, value: int) -> None:
+        if value != self.frame_rate_mode:
+            self.settings.put(FRAME_RATE_MODE_KEY, body_xml(f"<constantFrameRate>{value}</constantFrameRate>"))
+
+    async def apply_compression(self, payload: bytes) -> None:
+        """57: resolution / frame rate / bitrate / codec go to the Hikvision camera."""
+        root = st._body(payload)
+        for idx, tag, src, attr in ((1, "mainStream", self.main, "hik_bitrate"),
+                                    (2, "subStream", self.sub, "hik_sub_bitrate")):
+            el = root.find(f"Compression/{tag}")
+            if el is None or src is None:
+                continue
+            info = src.info or StreamInfo()
+            kbps_now = getattr(self, attr) or 0
+            num = lambda t, d: int(el.findtext(t) or d)  # noqa: E731
+            w, h, fps, kbps = num("width", info.width), num("height", info.height), \
+                num("frame", info.fps), num("bitRate", kbps_now)
+            # videoEncType is ignored: the app sends 0 for the main stream whatever it was told
+            audio = None
+            if idx == 1 and self.audio and el.findtext("audio") is not None:
+                audio = el.findtext("audio") != "0"
+                if audio == self.audio_on:
+                    audio = None
+            mode = (el.findtext("encoderType") or "").lower()
+            mode = mode if mode in ("cbr", "vbr") and mode != self.hikcfg.bitrate_mode.get(idx, "vbr") else None
+            video_changed = (w, h, fps) != (info.width, info.height, info.fps)
+            if not video_changed and kbps == kbps_now and audio is None and mode is None:
+                continue
+            await self.hikcfg.set_stream(idx, w, h, fps, kbps, audio, mode)
+            codec, w, h, fps, kbps = await self.hikcfg.stream_state(idx)
+            log.info("%s: Hikvision %s now %dx%d %d fps %d kbps %s %s", self.cfg.name, tag, w, h, fps, kbps, codec,
+                     self.hikcfg.bitrate_mode.get(idx, "vbr"))
+            setattr(self, attr, kbps)
+            if audio is not None:
+                self.audio_on = audio
+            if video_changed:
+                src.reconfigure(StreamInfo(codec, w, h, fps))
 
     # ---------------------------------------------------------------- events
     def on_alert(self, alert: hik.HikAlert) -> None:
@@ -146,6 +314,8 @@ class VirtualCamera:
                 # smart type not advertised: still report the person/vehicle as AI + motion
                 kind = "motion"
             self.state.apply(DetEvent(kind, ev.active, ev.zone, targets))
+            if ev.active and (targets or kind in SMART_TYPES):
+                self.journal.add(set(targets) | ({kind} if kind in SMART_TYPES else set()))
         if evs:
             self._maybe_push()
 
@@ -207,6 +377,15 @@ class VirtualCamera:
         return sum(SMART_BITS[t] for t in SMART_TYPES if self.cfg.smart_zones.get(t))
 
     @property
+    def mac(self) -> str:
+        return (self.cfg.mac or discovery.default_mac(self.cfg.name)).upper()
+
+    @property
+    def ip(self) -> str:
+        h = self.cfg.listen_host
+        return h if h not in ("", "0.0.0.0") else discovery.local_ip_for(self.cfg.hik_host or "8.8.8.8")
+
+    @property
     def display_name(self) -> str:
         return self.settings.name or self.cfg.display_name or self.cfg.name
 
@@ -245,6 +424,20 @@ class VirtualCamera:
             "name": xml_escape(self.display_name), "model": self.cfg.model, "hardware": self.cfg.hardware,
             "firmware": self.cfg.firmware, "build_day": self.cfg.build_day, "detail": self.cfg.detail,
             "serial": self.serial, "uid": self.uid, "username": username or self.cfg.username,
+            "uid_ability": "uid_ro, " if self.uid else "", "p2p_ability": "ptop_rw, " if self.uid else "",
+            "stream_info_list": self.stream_info_list(), "audio_on": 1 if self.audio_on else 0,
+            "main_mode": self.hikcfg.bitrate_mode.get(1, "vbr") if self.hikcfg else "vbr",
+            "sub_mode": self.hikcfg.bitrate_mode.get(2, "vbr") if self.hikcfg else "vbr",
+            "no_audio": 0 if self.audio else 1, "audio_version": 31 if self.audio else 0,
+            "led_ctrl": 6 if self.hikcfg and self.hikcfg.light_on_mode else 0,
+            "light_type": 1 if self.hikcfg and self.hikcfg.light_on_mode else 0,
+            "light_ability": ", ledState_rw" if self.hikcfg and self.hikcfg.light_on_mode else "",
+            "light_seconds": self.cfg.light_seconds,
+            "disk_num": 1 if self.recordings else 0, "record_ver": 3 if self.recordings else 0,
+            "replay_version": 21 if self.recordings else 0,
+            "record_ability": RECORD_ABILITY if self.recordings else "",
+            "bc_port": self.cfg.listen_port, "ip": self.ip, "mask": "255.255.255.0",
+            "gateway": self.ip.rsplit(".", 1)[0] + ".1", "mac": self.mac.lower(),
             "main_w": mi.width, "main_h": mi.height, "main_fps": mi.fps,
             "sub_w": si.width, "sub_h": si.height, "sub_fps": si.fps,
             "main_venc": 1 if mi.codec == "H265" else 0, "sub_venc": 1 if si.codec == "H265" else 0,

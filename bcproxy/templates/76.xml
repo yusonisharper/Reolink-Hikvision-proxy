@@ -1,0 +1,16 @@
+<Dhcp version="1.1">
+<enable>0</enable>
+</Dhcp>
+<AutoDns version="1.1">
+<enable>0</enable>
+</AutoDns>
+<Ip version="1.1">
+<ip>${ip}</ip>
+<mask>${mask}</mask>
+<mac>${mac}</mac>
+<gateway>${gateway}</gateway>
+</Ip>
+<Dns version="1.1">
+<dns1>${gateway}</dns1>
+<dns2></dns2>
+</Dns>
