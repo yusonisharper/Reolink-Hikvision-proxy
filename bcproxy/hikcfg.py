@@ -161,6 +161,10 @@ DAYNIGHT_FROM_HIK = {"day": "color", "night": "blackAndWhite"}
 # Reolink hdrSwitch (reolink_aio HDREnum: 0 off, 1 auto, 2 on) <-> Hikvision WDR mode
 HDR_TO_HIK = {0: "close", 1: "auto", 2: "open"}
 HDR_FROM_HIK = {v: k for k, v in HDR_TO_HIK.items()}
+# Bitrate mode lives in the image page (25/26), not in Compression. Observed in the
+# app: choosing "Variable" sends encType 0.
+ENC_TYPE_TO_MODE = {0: "vbr", 1: "cbr"}
+ENC_TYPE_FROM_MODE = {v: k for k, v in ENC_TYPE_TO_MODE.items()}
 
 
 class HikConfig:
@@ -169,6 +173,7 @@ class HikConfig:
         self.caps: dict[int, StreamCaps] = {}     # 1 = main, 2 = sub
         self.bitrate_mode: dict[int, str] = {}    # stream -> "cbr" / "vbr"
         self.light_on_mode: str | None = None     # supplementLightMode that means "light on"
+        self.has_tamper = False
 
     # ---------------------------------------------------------------- streams
     def _stream_path(self, idx: int) -> str:
@@ -190,6 +195,24 @@ class HikConfig:
             self.light_on_mode = next((x for x in modes if "white" in x.lower()), None)
         except Exception as e:  # noqa: BLE001 - no supplement light on this model
             log.debug("no supplement light: %s", e)
+        try:
+            await self.tamper_enabled()
+            self.has_tamper = True
+        except ConnectionError as e:  # model without tamper detection
+            log.debug("no tamper detection: %s", e)
+
+    @property
+    def _tamper_path(self) -> str:
+        return f"/ISAPI/System/Video/inputs/channels/{self.channel}/tamperDetection"
+
+    async def tamper_enabled(self) -> bool:
+        return _tag((await self.http.get_bytes(self._tamper_path)).decode("utf-8"), "enabled") == "true"
+
+    async def set_tamper(self, enable: bool) -> None:
+        doc = (await self.http.get_bytes(self._tamper_path)).decode("utf-8")
+        status, body = await self.http.put_bytes(self._tamper_path,
+                                                 _set(doc, "enabled", str(enable).lower()).encode("utf-8"))
+        _check(status, body, "PUT tamper detection")
 
     async def audio_enabled(self) -> bool:
         doc = (await self.http.get_bytes(self._stream_path(1))).decode("utf-8", "replace")
@@ -204,7 +227,7 @@ class HikConfig:
                 int(_tag(doc, "maxFrameRate", "0")) // 100, int(_tag(doc, "vbrUpperCap", "0")))
 
     async def set_stream(self, idx: int, width: int, height: int, fps: int, kbps: int,
-                         audio: bool | None = None, mode: str | None = None) -> None:
+                         audio: bool | None = None) -> None:
         caps = self.caps.get(idx)
         if caps and caps.sizes and (width, height) not in caps.sizes:
             raise ValueError(f"{width}x{height} not offered by Hikvision: {caps.sizes}")
@@ -212,15 +235,24 @@ class HikConfig:
         doc = (await self.http.get_bytes(path)).decode("utf-8")
         doc = _set(_set(doc, "videoResolutionWidth", width), "videoResolutionHeight", height)
         doc = _set(_set(_set(doc, "maxFrameRate", fps * 100), "constantBitRate", kbps), "vbrUpperCap", kbps)
-        if mode:
-            doc = _set(doc, "videoQualityControlType", mode.upper())
         if audio is not None:
             doc = re.sub(r"(<Audio>.*?<enabled>)\w+(</enabled>)", rf"\g<1>{str(audio).lower()}\g<2>", doc,
                          count=1, flags=re.S)
         status, body = await self.http.put_bytes(path, doc.encode("utf-8"))
         _check(status, body, f"PUT stream {idx}")
-        if mode:
-            self.bitrate_mode[idx] = mode.lower()
+
+    async def set_bitrate_mode(self, mode: str) -> None:
+        """The app's bitrate mode is one setting for the camera; Hikvision has one per stream."""
+        for idx in (1, 2):
+            if self.bitrate_mode.get(idx, "vbr") == mode:
+                continue
+            path = self._stream_path(idx)
+            doc = (await self.http.get_bytes(path)).decode("utf-8")
+            status, body = await self.http.put_bytes(
+                path, _set(doc, "videoQualityControlType", mode.upper()).encode("utf-8"))
+            _check(status, body, f"PUT stream {idx} {mode}")
+            self.bitrate_mode[idx] = mode
+            log.info("Hikvision stream %d bitrate mode now %s", idx, mode)
 
     # ------------------------------------------------------------------ image
     def _image_path(self, sub: str) -> str:
@@ -256,6 +288,7 @@ class HikConfig:
             "InputAdvanceCfg/flip": 1 if style in ("UPDOWN", "CENTER") else 0,
             "InputAdvanceCfg/nr3d/enable": 0 if _tag(d["NoiseReduce"], "mode") == "close" else 1,
             "InputAdvanceCfg/constantFrameRate": frame_rate_mode,
+            "InputAdvanceCfg/encType": ENC_TYPE_FROM_MODE.get(self.bitrate_mode.get(1, "vbr"), 1),
         }
         root = _body(template)
         adv = root.find("InputAdvanceCfg")
@@ -332,6 +365,11 @@ class HikConfig:
         hdr = HDR_TO_HIK.get(num("InputAdvanceCfg/hdrSwitch"))
         if hdr and d["WDR"] and hdr != _tag(d["WDR"], "mode"):
             await put("WDR", _set(d["WDR"], "mode", hdr))
+
+        mode = ENC_TYPE_TO_MODE.get(num("InputAdvanceCfg/encType"))
+        if mode and mode != self.bitrate_mode.get(1, "vbr"):
+            await self.set_bitrate_mode(mode)
+            changed.append(f"bitrate mode {mode}")
 
         nr = num("InputAdvanceCfg/nr3d/enable")
         if nr is not None and bool(nr) == (_tag(d["NoiseReduce"], "mode") == "close"):

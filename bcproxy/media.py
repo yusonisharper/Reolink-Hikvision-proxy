@@ -56,16 +56,34 @@ async def probe(url: str, ffprobe: str = "ffprobe", timeout: float = 15) -> Stre
     return StreamInfo(codec, int(s.get("width") or 0), int(s.get("height") or 0), fps)
 
 
-async def read_access_units(url: str, codec: str, ffmpeg: str = "ffmpeg"):
-    """One-shot ffmpeg (playback): yields AccessUnits until the source ends."""
+async def read_access_units(url: str, codec: str, ffmpeg: str = "ffmpeg", first_timeout: float = 15,
+                            stall_timeout: float = 2):
+    """One-shot ffmpeg (playback): yields AccessUnits until the source ends. Hikvision playback
+    neither sends more nor hangs up at the end of its time range, so a silent source also counts as
+    ended. (No -fflags nobuffer / small -probesize: measured, they give no picture at all here.)"""
     proc = await asyncio.create_subprocess_exec(
         ffmpeg, "-hide_banner", "-loglevel", "error", *_input_opts(url, probe=True), "-i", url,
         "-map", "0:v:0", "-c:v", "copy", "-f", "h264" if codec == "H264" else "hevc", "pipe:1",
         stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
     parser = AnnexBParser(codec)
+    timeout = first_timeout
     try:
         assert proc.stdout
-        while data := await proc.stdout.read(65536):
+        while True:
+            # asyncio.wait, not wait_for: wait_for loses a cancel that arrives just as the
+            # read completes, which leaves the old replay running after a seek
+            read = asyncio.ensure_future(proc.stdout.read(65536))
+            try:
+                done, _ = await asyncio.wait({read}, timeout=timeout)
+            finally:
+                if not read.done():
+                    read.cancel()
+            if not done:
+                return
+            data = read.result()
+            if not data:
+                return
+            timeout = stall_timeout
             for au in parser.feed(data):
                 yield au
     finally:

@@ -23,6 +23,7 @@ log = logging.getLogger("camera")
 
 FRAME_RATE_MODE_KEY = 25      # settings store slot (write id of the image page)
 AITYPE_BITS = {"people": 1 << 1, "vehicle": 1 << 2, "face": 1 << 3, "dog_cat": 1 << 4}
+AITYPE_TAMPER = 1 << 25       # the app's Tamper Alert (reolink_aio: aitype bit 25)
 SMART_BITS = {"crossline": 1 << 1, "intrusion": 1 << 2, "loitering": 1 << 3}
 
 
@@ -279,18 +280,17 @@ class VirtualCamera:
             num = lambda t, d: int(el.findtext(t) or d)  # noqa: E731
             w, h, fps, kbps = num("width", info.width), num("height", info.height), \
                 num("frame", info.fps), num("bitRate", kbps_now)
-            # videoEncType is ignored: the app sends 0 for the main stream whatever it was told
+            # videoEncType and encoderType are ignored: the app sends 0 / vbr whatever it was told.
+            # Bitrate mode comes with the image page (encType), see HikConfig.apply_image.
             audio = None
             if idx == 1 and self.audio and el.findtext("audio") is not None:
                 audio = el.findtext("audio") != "0"
                 if audio == self.audio_on:
                     audio = None
-            mode = (el.findtext("encoderType") or "").lower()
-            mode = mode if mode in ("cbr", "vbr") and mode != self.hikcfg.bitrate_mode.get(idx, "vbr") else None
             video_changed = (w, h, fps) != (info.width, info.height, info.fps)
-            if not video_changed and kbps == kbps_now and audio is None and mode is None:
+            if not video_changed and kbps == kbps_now and audio is None:
                 continue
-            await self.hikcfg.set_stream(idx, w, h, fps, kbps, audio, mode)
+            await self.hikcfg.set_stream(idx, w, h, fps, kbps, audio)
             codec, w, h, fps, kbps = await self.hikcfg.stream_state(idx)
             log.info("%s: Hikvision %s now %dx%d %d fps %d kbps %s %s", self.cfg.name, tag, w, h, fps, kbps, codec,
                      self.hikcfg.bitrate_mode.get(idx, "vbr"))
@@ -370,7 +370,8 @@ class VirtualCamera:
     # -------------------------------------------------------------- template
     @property
     def aitype_bits(self) -> int:
-        return sum(AITYPE_BITS[t] for t in self.cfg.ai_types if t in AITYPE_BITS)
+        bits = sum(AITYPE_BITS[t] for t in self.cfg.ai_types if t in AITYPE_BITS)
+        return bits | (AITYPE_TAMPER if self.hikcfg and self.hikcfg.has_tamper else 0)
 
     @property
     def smartai_bits(self) -> int:

@@ -209,3 +209,230 @@ def test_alerts_feed_journal():
     cam.on_alert(hik.HikAlert("VMD", "active", 1, target="vehicle"))
     cam.on_alert(hik.HikAlert("fielddetection", "active", 1, [(1, "human")]))
     assert sorted(k for _, k in cam.journal.items) == ["intrusion", "people", "vehicle"]
+
+
+def test_file_list_stays_under_the_app_message_limit():
+    """726 clips of mixed types were listed as 67 entries, 41 KB: the app hung on that reply."""
+    t = dt.datetime(2026, 11, 3)
+    kinds = ["md", "vehicle,intrusion", "people,vehicle,intrusion", "vehicle"]
+    segs = [pb.Segment(t + dt.timedelta(seconds=110 * i), t + dt.timedelta(seconds=110 * i + 20), kinds[i % 4])
+            for i in range(726)]
+    xml, listed = pb.file_list_limited(1, "subStream", segs, t, t + dt.timedelta(days=1))
+    assert len(xml.encode()) <= pb.MAX_REPLY_BYTES and 0 < listed <= 60
+    assert xml.count("<FileInfo>") == listed
+    few, n = pb.file_list_limited(1, "subStream", segs[:5], t, t + dt.timedelta(days=1))
+    assert n == 5 and few.count("<FileInfo>") == 5     # short lists stay as they are
+
+
+def _replay_cam():
+    cam = VirtualCamera(CameraConfig(name="t", password="pw", listen_host="127.0.0.1"))
+    cam.recordings = pb.HikRecordings(FakeHttp())
+    cam.main = FakeMain()
+    cam.cfg.main_rtsp = "rtsp://u:p@h/Streaming/Channels/101"
+    return cam
+
+
+def test_replay_plays_one_clip_and_seek_starts_another(monkeypatch):
+    urls = []
+
+    async def fake_aus(url, codec):
+        urls.append(url)
+        yield AccessUnit(b"\x00\x00\x00\x01\x65" + bytes(100), True)
+        yield AccessUnit(b"\x00\x00\x00\x01\x41" + bytes(100), False)
+
+    monkeypatch.setattr(session, "read_access_units", fake_aus)
+    seq, seq2 = 1793769300, 1793769347
+
+    async def run():
+        cam = _replay_cam()
+        srv = await asyncio.start_server(lambda r, w: BcSession(cam, r, w).run(), "127.0.0.1", 0)
+        c = bc_client.Client("127.0.0.1", srv.sockets[0].getsockname()[1], "admin", "pw")
+        await c.connect()
+        await c.login()
+        r = await c.request(381, payload=bc.body_xml(
+            f'<ReplayByTimeV2 version="1.1">\n<seq>{seq}</seq>\n' + _t("startTime", 2026, 11, 1, 7, 0, 0)
+            + _t("endTime", 2026, 11, 1, 9, 30, 0) + "<streamType>mainStream</streamType>\n</ReplayByTimeV2>"))
+        q = c.subs[(381, r.msg_num)]
+        seen, infos, rd, kinds = set(), [], BcMediaReader(), []
+        while len(kinds) < 2:
+            m = await asyncio.wait_for(q.get(), 3)
+            if m.binary:
+                seen.add(m.cls << 16 | m.response)
+                kinds += [x[0] for x in rd.feed(m.payload)]
+            elif b"replayStreamInfo" in m.payload:
+                infos.append(m.payload)
+        await asyncio.sleep(0.1)         # the clip ended: nothing else starts by itself
+        one_stream = len(urls)
+        s = await c.request(383, payload=bc.body_xml(
+            f'<ReplaySeekV2 version="1.1">\n<seq>{seq2}</seq>\n' + _t("seekTime", 2026, 11, 1, 8, 30, 0)
+            + "</ReplaySeekV2>"))
+        after, info = set(), None
+        while seq2 not in after:
+            m = await asyncio.wait_for(q.get(), 3)
+            if m.binary:
+                after.add(m.cls << 16 | m.response)
+            elif b"replayStreamInfo" in m.payload:
+                info = m.payload
+        stop = await c.request(382)
+        bad = await c.request(383, payload=bc.body_xml(
+            f'<ReplaySeekV2 version="1.1">\n<seq>{seq2}</seq>\n' + _t("seekTime", 2026, 11, 1, 8, 30, 0)
+            + "</ReplaySeekV2>"))
+        c.writer.close()
+        srv.close()
+        return seen, infos, one_stream, s.response, info, stop.response, bad.response
+
+    seen, infos, one_stream, seek, info, stop, bad = asyncio.run(run())
+    assert seen == {seq} and seek == 200 and stop == 200 and bad == 400
+    assert len(infos) == 1 and xml_value(infos[0], "minute") == "58"
+    assert one_stream == 1                     # no auto-advance to the 09:00 clip
+    assert "starttime=20261101T155808Z&endtime=20261101T165808Z" in urls[0]     # exactly that clip
+    assert xml_value(info, "seq") == str(seq2)
+    assert "starttime=20261101T163000Z" in urls[1]                               # 08:30 local
+
+
+def test_starting_a_replay_takes_one_search_request():
+    http = FakeHttp()
+    rec = pb.HikRecordings(http)
+    asyncio.run(rec.search(dt.datetime(2026, 11, 1), dt.datetime(2026, 11, 1, 23), limit=1))
+    assert len(http.bodies) == 1 and b"<maxResults>1</maxResults>" in http.bodies[0]
+
+
+def test_full_list_is_cached_briefly():
+    http = FakeHttp()
+    rec = pb.HikRecordings(http)
+    span = dt.datetime(2026, 11, 1), dt.datetime(2026, 11, 1, 23)
+
+    async def run():
+        first = await rec.search(*span)
+        calls = len(http.bodies)
+        again = await rec.search(*span)
+        assert again == first and len(http.bodies) == calls
+        rec._lists = {k: (v[0] - pb.LIST_CACHE_SECONDS - 1, v[1]) for k, v in rec._lists.items()}
+        await rec.search(*span)
+        assert len(http.bodies) > calls
+
+    asyncio.run(run())
+
+
+def test_read_access_units_treats_a_silent_source_as_ended(monkeypatch):
+    """Hikvision keeps the RTSP session open at the end of a clip: don't wait for it forever."""
+    import time
+    from bcproxy import media
+
+    class Out:
+        calls = 0
+
+        async def read(self, n):
+            Out.calls += 1
+            if Out.calls == 1:
+                return b"\x00\x00\x00\x01\x65" + bytes(64)
+            await asyncio.sleep(60)
+
+    class Proc:
+        stdout, stderr, returncode, pid = Out(), None, None, 1
+        killed = False
+
+        def kill(self):
+            Proc.killed = True
+
+        async def wait(self):
+            return 0
+
+    async def spawn(*a, **k):
+        return Proc()
+
+    monkeypatch.setattr(media.asyncio, "create_subprocess_exec", spawn)
+
+    async def run():
+        t0 = time.monotonic()
+        async for _ in media.read_access_units("clip.mp4", "H264", first_timeout=5, stall_timeout=0.2):
+            pass
+        return time.monotonic() - t0
+
+    assert asyncio.run(run()) < 2 and Proc.killed
+
+
+def test_cancel_stops_the_reader_even_while_data_keeps_coming(monkeypatch):
+    """A seek cancels the running replay; it must not survive that and keep the RTSP session."""
+    from bcproxy import media
+
+    class Out:
+        async def read(self, n):
+            await asyncio.sleep(0)         # always ready: the race wait_for loses
+            return b"\x00\x00\x00\x01\x65" + bytes(64)
+
+    class Proc:
+        stdout, stderr, returncode, pid = Out(), None, None, 1
+        killed = False
+
+        def kill(self):
+            Proc.killed = True
+
+        async def wait(self):
+            return 0
+
+    async def spawn(*a, **k):
+        return Proc()
+
+    monkeypatch.setattr(media.asyncio, "create_subprocess_exec", spawn)
+
+    async def consume():
+        async for _ in media.read_access_units("clip.mp4", "H264"):
+            pass
+
+    async def run():
+        for _ in range(50):
+            t = asyncio.create_task(consume())
+            await asyncio.sleep(0.002)
+            t.cancel()
+            try:
+                await asyncio.wait_for(asyncio.shield(t), 1)
+            except asyncio.CancelledError:
+                pass
+            assert t.done(), "reader survived the cancel"
+
+    asyncio.run(run())
+    assert Proc.killed
+
+
+def test_replay_falls_back_to_the_codec_the_clip_was_recorded_with(monkeypatch):
+    tried = []
+
+    async def fake_aus(url, codec):
+        tried.append(codec)
+        if codec == "H265":        # ffmpeg: "hevc muxer supports only codec hevc"
+            return
+        yield AccessUnit(b"\x00\x00\x00\x01\x65" + bytes(100), True)
+        yield AccessUnit(b"\x00\x00\x00\x01\x41" + bytes(100), False)
+
+    monkeypatch.setattr(session, "read_access_units", fake_aus)
+
+    class Main:
+        info = StreamInfo("H265", 640, 360, 10)
+
+        async def ensure_info(self):
+            return self.info
+
+    async def run():
+        cam = VirtualCamera(CameraConfig(name="t", password="pw", listen_host="127.0.0.1"))
+        cam.recordings = pb.HikRecordings(FakeHttp())
+        cam.main = Main()
+        cam.cfg.main_rtsp = "rtsp://u:p@h/Streaming/Channels/101"
+        srv = await asyncio.start_server(lambda r, w: BcSession(cam, r, w).run(), "127.0.0.1", 0)
+        c = bc_client.Client("127.0.0.1", srv.sockets[0].getsockname()[1], "admin", "pw")
+        await c.connect()
+        await c.login()
+        r = await c.request(381, payload=bc.body_xml(
+            '<ReplayByTimeV2 version="1.1">\n<seq>1793769300</seq>\n' + _t("startTime", 2026, 11, 1, 7, 0, 0)
+            + _t("endTime", 2026, 11, 1, 8, 0, 0) + "<streamType>mainStream</streamType>\n</ReplayByTimeV2>"))
+        q = c.subs[(381, r.msg_num)]
+        rd, kinds = BcMediaReader(), []
+        while "I" not in kinds:
+            m = await asyncio.wait_for(q.get(), 3)
+            if m.binary:
+                kinds += [x[0] for x in rd.feed(m.payload)]
+        c.writer.close()
+        srv.close()
+
+    asyncio.run(run())
+    assert tried[:2] == ["H265", "H264"]

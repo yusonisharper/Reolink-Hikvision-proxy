@@ -28,15 +28,17 @@ def info_v2(width: int, height: int, fps: int) -> bytes:
             + ymdhms + ymdhms + b"\x00\x00")
 
 
-def iframe(codec: str, data: bytes, micros: int, unix_time: int | None = None) -> bytes:
+def iframe(codec: str, data: bytes, micros: int, unix_time: int | None = None, file_no: int = 0) -> bytes:
+    """file_no: last header field. In replay real cameras change it when the next recording file
+    starts (same value for all frames of a file); that is how the app notices the switch."""
     extra = b"" if unix_time is None else struct.pack("<II", unix_time & 0xFFFFFFFF, 0)
     hdr = struct.pack("<I4sIIII", MAGIC_IFRAME, codec.encode(), len(data), len(extra),
-                      micros & 0xFFFFFFFF, 0)
+                      micros & 0xFFFFFFFF, file_no)
     return hdr + extra + data + _pad(len(data))
 
 
-def pframe(codec: str, data: bytes, micros: int) -> bytes:
-    hdr = struct.pack("<I4sIIII", MAGIC_PFRAME, codec.encode(), len(data), 0, micros & 0xFFFFFFFF, 0)
+def pframe(codec: str, data: bytes, micros: int, file_no: int = 0) -> bytes:
+    hdr = struct.pack("<I4sIIII", MAGIC_PFRAME, codec.encode(), len(data), 0, micros & 0xFFFFFFFF, file_no)
     return hdr + data + _pad(len(data))
 
 
@@ -64,13 +66,14 @@ class BcMediaReader:
             elif (magic & 0xFFFF0000) == 0x63640000 and ((magic >> 8) & 0xFF) in (0x30, 0x31):
                 if len(self.buf) < 24:
                     break
-                _, codec, ln, extra, micros, _ = struct.unpack_from("<I4sIIII", self.buf)
+                _, codec, ln, extra, micros, file_no = struct.unpack_from("<I4sIIII", self.buf)
                 total = 24 + extra + ln + (-ln % PAD)
                 if len(self.buf) < total:
                     break
                 data_ = bytes(self.buf[24 + extra:24 + extra + ln])
                 kind = "I" if ((magic >> 8) & 0xFF) == 0x30 else "P"
-                out.append((kind, {"codec": codec.decode(errors="replace"), "micros": micros}, data_))
+                out.append((kind, {"codec": codec.decode(errors="replace"), "micros": micros, "file_no": file_no},
+                            data_))
                 del self.buf[:total]
             elif magic in (MAGIC_AAC, 0x62773130):
                 ln = struct.unpack_from("<H", self.buf, 4)[0]

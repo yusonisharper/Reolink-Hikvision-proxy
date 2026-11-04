@@ -35,10 +35,11 @@ MSG_ONLINE_USERS = 120
 MSG_RECORD_CFG, MSG_RECORD_CFG_SET, MSG_COMPRESSION_SET, MSG_RECORD, MSG_RECORD_SET = 54, 55, 57, 81, 82
 MSG_LIGHT_MANUAL, MSG_LIGHT_STATUS = 288, 291
 MSG_IMAGE_SET, MSG_IMAGE, MSG_IMAGE_RANGES, MSG_PORTS, MSG_PORTS_SET = 25, 26, 132, 37, 38
+MSG_TAMPER, MSG_TAMPER_SET = 763, 764
 CONTROL_IDS = {MSG_RECORD_CFG, MSG_RECORD_CFG_SET, MSG_COMPRESSION_SET, MSG_RECORD, MSG_RECORD_SET, MSG_LIGHT_MANUAL,
-               MSG_IMAGE_SET, MSG_IMAGE, MSG_IMAGE_RANGES, MSG_PORTS, MSG_PORTS_SET}
+               MSG_IMAGE_SET, MSG_IMAGE, MSG_IMAGE_RANGES, MSG_PORTS, MSG_PORTS_SET, MSG_TAMPER, MSG_TAMPER_SET}
 PLAYBACK_IDS = {pb.MSG_HDD, pb.MSG_DAY_RECORDS, pb.MSG_FILE_OPEN, pb.MSG_FILE_LIST, pb.MSG_FILE_CLOSE,
-                pb.MSG_COVER, pb.MSG_REPLAY, pb.MSG_REPLAY_STOP}
+                pb.MSG_COVER, pb.MSG_REPLAY, pb.MSG_REPLAY_STOP, pb.MSG_REPLAY_SEEK}
 
 
 class BcSession:
@@ -58,6 +59,8 @@ class BcSession:
         self.searches: dict[int, tuple[dt.datetime, dt.datetime, str]] = {}   # record search handles
         self.next_handle = 0
         self.replay: asyncio.Task | None = None
+        self.replay_file_no = 0
+        self.replay_session: tuple[BcMsg, dt.datetime, str] | None = None   # (381 request, end, stream)
         self.tasks: set[asyncio.Task] = set()
         self.trace = trace
         self._wlock = asyncio.Lock()
@@ -67,7 +70,7 @@ class BcSession:
     # ------------------------------------------------------------------- io
     async def send(self, msg: BcMsg) -> None:
         data = bc.encode(msg, self.crypter, self.decoder.magic or bc.MAGIC)
-        if self.trace and (not msg.binary or msg.ext):
+        if self.trace and not msg.binary:
             log.debug("%s >> id=%d num=%d resp=%#x\n%s%s", self.tag, msg.msg_id, msg.msg_num,
                       msg.response, msg.ext_text, msg.payload_text)
         self.cam.tx.add(len(data))
@@ -328,6 +331,15 @@ class BcSession:
                 if rate is not None:
                     self.cam.set_frame_rate_mode(int(rate))
                 await self.send(msg.reply(200))
+            elif mid == MSG_TAMPER:
+                on = await cfg.tamper_enabled()
+                await self.send(msg.reply(200, payload=body_xml(
+                    f'<tamperAlarmCfg version="1.1">\n<enable>{1 if on else 0}</enable>\n</tamperAlarmCfg>')))
+            elif mid == MSG_TAMPER_SET:
+                on = xml_value(msg.payload, "enable") == "1"
+                await cfg.set_tamper(on)
+                log.info("%s: Hikvision tamper detection %s", self.tag, "on" if on else "off")
+                await self.send(msg.reply(200))
             elif mid == MSG_PORTS:
                 await self.send(msg.reply(200, payload=body_xml(await cfg.server_ports_xml(self.cam.cfg.listen_port))))
             elif mid == MSG_PORTS_SET:
@@ -470,19 +482,36 @@ class BcSession:
                     raise ValueError(f"unknown handle {handle}")
                 start, end, stream = self.searches[handle]
                 found = await rec.search(start, end)
-                segs = pb.merge_segments([pb.Segment(s.start, s.end, self.cam.journal.label(s)) for s in found],
-                                         start, end)
+                xml, listed = pb.file_list_limited(
+                    handle, stream, [pb.Segment(s.start, s.end, self.cam.journal.label(s)) for s in found], start, end)
                 log.info("%s: record search %s .. %s: %d segment(s), listed as %d", self.tag, start, end,
-                         len(found), len(segs))
-                await self.send(msg.reply(200, payload=body_xml(pb.file_list_xml(handle, stream, segs))))
+                         len(found), listed)
+                await self.send(msg.reply(200, payload=body_xml(xml)))
             elif mid == pb.MSG_FILE_CLOSE:
                 self.searches.pop(int(xml_value(msg.payload, "handle") or -1), None)
                 await self.send(msg.reply(200))
             elif mid == pb.MSG_REPLAY:
                 self._stop_replay()
-                self.replay = self._spawn(self._replay(msg))
+                el = pb.body_root(msg.payload, "ReplayByTimeV2")
+                start, end = pb.parse_time(el.find("startTime")), pb.parse_time(el.find("endTime"))
+                if not start or not end:
+                    raise ValueError("no time range")
+                stream = el.findtext("streamType") or "mainStream"
+                self.replay_session = (msg, end, stream)
+                self.replay = self._spawn(self._replay(msg, pb.seq_of(msg.payload), start, end, stream))
+            elif mid == pb.MSG_REPLAY_SEEK:
+                el = pb.body_root(msg.payload, "ReplaySeekV2")
+                to = pb.parse_time(el.find("seekTime"))
+                if not to or not self.replay_session:
+                    raise ValueError("seek without a replay")
+                self._stop_replay()
+                req, end, stream = self.replay_session
+                await self.send(msg.reply(200))
+                log.info("%s: replay seek to %s", self.tag, to)
+                self.replay = self._spawn(self._replay(req, pb.seq_of(msg.payload), to, end, stream, seek=True))
             elif mid == pb.MSG_REPLAY_STOP:
                 self._stop_replay()
+                self.replay_session = None
                 await self.send(msg.reply(200))
             else:   # 298 timeline thumbnails
                 await self.send(msg.reply(400))
@@ -495,54 +524,72 @@ class BcSession:
             self.replay.cancel()
         self.replay = None
 
-    async def _replay(self, req: BcMsg) -> None:
+    async def _replay(self, req: BcMsg, seq: int, start: dt.datetime, end: dt.datetime, stream: str,
+                      seek: bool = False) -> None:
+        """Play the one recording at or after start, then stop: the user picks what plays next.
+        req is the 381 that opened the session: its frames stay on that id, also after a seek."""
         rec = self.cam.recordings
-        seq = pb.seq_of(req.payload)
-        el = pb.body_root(req.payload, "ReplayByTimeV2")
-        start = pb.parse_time(el.find("startTime")) if el is not None else None
-        end = pb.parse_time(el.find("endTime")) if el is not None else None
-        stream = (el.findtext("streamType") if el is not None else None) or "mainStream"
-        try:
-            if not start or not end:
-                raise ValueError("no time range")
-            info = await self.cam.main.ensure_info()
-            segs = await rec.search(start, end, limit=1)
-            if not segs:
-                raise ValueError(f"no recording after {start}")
-            begin = max(start, segs[0].start)
-        except Exception as e:  # noqa: BLE001
-            log.warning("%s: replay failed: %s", self.tag, e)
-            await self.send(req.reply(400))
-            return
-        await self.send(req.reply(200))
-        await self.send(req.reply(200, ext=ext_xml(channelId=0), payload=body_xml(
-            pb.replay_info_xml(seq, stream, info.width, info.height, info.fps, begin, segs[0].end))))
-        url = await rec.replay_url(self.cam.cfg.main_rtsp, begin, end)
-        ext = ext_xml(binaryData=1, channelId=0)
-        log.info("%s: replay from %s (seq %d)", self.tag, begin, seq)
         frames = sent = 0
         t0 = time.monotonic()
-        aus = read_access_units(url, info.codec)
         try:
-            async for au in aus:
-                if frames == 0 and not au.keyframe:
-                    continue
-                micros = int((time.monotonic() - t0) * 1_000_000)
-                wall = pb.wall_seconds(begin + dt.timedelta(microseconds=micros))
-                frame = (bcmedia.iframe(info.codec, au.data, micros, wall) if au.keyframe
-                         else bcmedia.pframe(info.codec, au.data, micros))
-                for i in range(0, len(frame), MEDIA_CHUNK):
-                    # replay frames carry the session seq where replies have response/class
-                    await self.send(BcMsg(pb.MSG_REPLAY, req.channel, req.stream_type, req.msg_num,
-                                          seq & 0xFFFF, seq >> 16, ext, frame[i:i + MEDIA_CHUNK], True))
-                frames += 1
-                sent += len(frame)
+            try:
+                info = await self.cam.main.ensure_info()
+                found = await rec.search(start, end, limit=1)
+            except Exception as e:  # noqa: BLE001
+                log.warning("%s: replay failed: %s", self.tag, e)
+                found = []
+            if not found:
+                log.info("%s: no recording after %s", self.tag, start)
+                if not seek:
+                    await self.send(req.reply(400))
+                return
+            clip = found[0]
+            begin = max(start, clip.start)
+            if not seek:
+                await self.send(req.reply(200))
+            # after a seek this request id is in binary mode: say that this one is XML
+            info_ext = ext_xml(binaryData=0, channelId=0) if seek else ext_xml(channelId=0)
+            await self.send(req.reply(200, ext=info_ext, payload=body_xml(pb.replay_info_xml(
+                seq, stream, info.width, info.height, info.fps, begin, clip.end))))
+            log.info("%s: replay %s .. %s (seq %d)", self.tag, begin, clip.end, seq)
+            self.replay_file_no += 1
+            url = await rec.replay_url(self.cam.cfg.main_rtsp, begin, clip.end)
+            length = (clip.end - begin).total_seconds()
+            ext = ext_xml(binaryData=1, channelId=0)
+            base_us = pb.wall_seconds(begin) * 1_000_000
+            # a clip keeps the codec it was recorded with, which may not be today's
+            for codec in dict.fromkeys((info.codec, "H265", "H264")):
+                clip_t0 = None
+                aus = read_access_units(url, codec)
+                try:
+                    async for au in aus:
+                        now = time.monotonic()
+                        if clip_t0 is None:
+                            if not au.keyframe:
+                                continue
+                            clip_t0 = now
+                        elapsed = now - clip_t0
+                        if elapsed > length + 1:    # Hikvision does not end the stream by itself
+                            break
+                        micros = base_us + int(elapsed * 1_000_000)
+                        wall = pb.wall_seconds(begin + dt.timedelta(seconds=elapsed))
+                        frame = (bcmedia.iframe(codec, au.data, micros, wall, self.replay_file_no) if au.keyframe
+                                 else bcmedia.pframe(codec, au.data, micros, self.replay_file_no))
+                        for i in range(0, len(frame), MEDIA_CHUNK):
+                            # replay frames carry the session seq where replies have response/class
+                            await self.send(BcMsg(pb.MSG_REPLAY, req.channel, req.stream_type, req.msg_num,
+                                                  seq & 0xFFFF, seq >> 16, ext, frame[i:i + MEDIA_CHUNK], True))
+                        frames += 1
+                        sent += len(frame)
+                finally:
+                    await aus.aclose()      # kills ffmpeg now, not at garbage collection
+                if clip_t0 is not None:
+                    break
         except asyncio.CancelledError:
             pass
         except (ConnectionError, OSError) as e:
             log.info("%s: replay ended: %s", self.tag, e)
         finally:
-            await aus.aclose()      # kills ffmpeg now, not at garbage collection
             log.info("%s: replay stopped after %.1fs: %d frames, %d KB", self.tag,
                      time.monotonic() - t0, frames, sent // 1024)
 

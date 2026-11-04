@@ -350,21 +350,31 @@ def test_server_ports_reflect_and_reach_hikvision():
     assert b"<ONVIF><enable>false<" in fake.docs["/ISAPI/System/Network/Integrate"]
 
 
-def test_bitrate_mode_reaches_hikvision():
-    cam, fake = _cam()
+def test_bitrate_mode_comes_from_the_image_page():
+    """Captured on a real Duo 2: the switch sends 25 with encType, never 57."""
+    cam, fake = _image_cam()
+    for path in ("/ISAPI/Streaming/channels/101", "/ISAPI/Streaming/channels/102"):
+        fake.docs[path] = fake.docs[path].replace(
+            b"<constantBitRate>", b"<videoQualityControlType>VBR</videoQualityControlType><constantBitRate>")
+    page = bc.body_xml('<InputAdvanceCfg version="1.1">\n<encType>{}</encType>\n</InputAdvanceCfg>')
 
     async def run():
         await cam.hikcfg.load()
-        assert cam.template_vars()["main_mode"] == "vbr"
+        template = cam.templates.render(132, cam.template_vars())
+        before = await cam.hikcfg.image_xml(template)
+        changed = await cam.hikcfg.apply_image(page.replace(b"{}", b"1"))
+        after = await cam.hikcfg.image_xml(template)
+        # a later stream save always says encoderType=vbr: it must not undo the choice
         await cam.apply_compression(bc.body_xml(
-            '<Compression version="1.1">\n<mainStream>\n<width>2688</width>\n<height>1520</height>\n<frame>30</frame>\n'
-            "<bitRate>4096</bitRate>\n<encoderType>cbr</encoderType>\n</mainStream>\n</Compression>"))
+            '<Compression version="1.1">\n<mainStream>\n<width>1920</width>\n<height>1080</height>\n<frame>30</frame>\n'
+            "<bitRate>4096</bitRate>\n<encoderType>vbr</encoderType>\n</mainStream>\n</Compression>"))
+        return before, changed, after
 
-    fake.docs["/ISAPI/Streaming/channels/101"] = fake.docs["/ISAPI/Streaming/channels/101"].replace(
-        b"<constantBitRate>", b"<videoQualityControlType>VBR</videoQualityControlType><constantBitRate>")
-    asyncio.run(run())
-    assert b"<videoQualityControlType>CBR<" in fake.docs["/ISAPI/Streaming/channels/101"]
-    assert cam.template_vars()["main_mode"] == "cbr"
+    before, changed, after = asyncio.run(run())
+    assert xml_value(before, "encType") == "0" and xml_value(after, "encType") == "1"
+    assert changed == ["bitrate mode cbr"]
+    for path in ("/ISAPI/Streaming/channels/101", "/ISAPI/Streaming/channels/102"):
+        assert b"<videoQualityControlType>CBR<" in fake.docs[path]
 
 
 def test_pages_get_data_not_an_empty_ok():
@@ -471,3 +481,46 @@ def test_hikvision_down_at_startup_is_retried():
     first, keeps_playback, second = asyncio.run(run())
     assert first is False and keeps_playback and second is True
     assert cam.hikcfg.caps[1].sizes and cam.hikcfg.light_on_mode == "colorVuWhiteLight"
+
+
+def test_tamper_alert():
+    cam, fake = _cam()
+    path = "/ISAPI/System/Video/inputs/channels/1/tamperDetection"
+    fake.docs[path] = (b"<TamperDetection><enabled>true</enabled><TamperDetectionRegionList><TamperDetectionRegion>"
+                       b"<enabled>true</enabled></TamperDetectionRegion></TamperDetectionRegionList></TamperDetection>")
+
+    async def run():
+        assert not cam.aitype_bits & (1 << 25)
+        await cam.hikcfg.load()
+        srv = await asyncio.start_server(lambda r, w: BcSession(cam, r, w).run(), "127.0.0.1", 0)
+        c = bc_client.Client("127.0.0.1", srv.sockets[0].getsockname()[1], "admin", "pw")
+        await c.connect()
+        await c.login()
+        ai = (await c.request(199)).payload
+        before = (await c.request(763)).payload
+        ok = (await c.request(764, payload=bc.body_xml(
+            '<tamperAlarmCfg version="1.1">\n<enable>0</enable>\n</tamperAlarmCfg>'))).response
+        after = (await c.request(763)).payload
+        c.writer.close()
+        srv.close()
+        return ai, before, ok, after
+
+    ai, before, ok, after = asyncio.run(run())
+    assert int(xml_value(ai, "aitype")) & (1 << 25)
+    assert xml_value(before, "enable") == "1" and ok == 200 and xml_value(after, "enable") == "0"
+    doc = fake.docs[path]
+    assert doc.count(b"<enabled>false</enabled>") == 1 and b"<TamperDetectionRegion><enabled>true" in doc
+
+
+def test_no_tamper_ability_without_hikvision_support():
+    cam, _ = _cam()
+    asyncio.run(cam.hikcfg.load())
+    assert not cam.hikcfg.has_tamper and not cam.aitype_bits & (1 << 25)
+
+
+def test_tamper_event_is_reported():
+    from bcproxy import hik
+    from bcproxy.events import alarm_event_xml
+    cam, _ = _cam()
+    cam.on_alert(hik.HikAlert("shelteralarm", "active", 1))
+    assert "tamper" in alarm_event_xml(cam.state.snapshot())

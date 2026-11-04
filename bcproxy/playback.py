@@ -11,6 +11,11 @@ Reolink app flow (captured from a real camera):
                               then BcMedia frames whose header carries <seq>
                               in the response/class bytes
   382  -                      stop replay
+  383  ReplaySeekV2           jump inside a replay: new <seq> + <seekTime>; frames continue on
+                              the 381 request with the new seq (not captured from a real camera)
+
+Replay plays the one selected recording and stops; the app's list merges clips (message size
+limit), so a seek into such a gap lands on the next recording.
   298  CoverPreview           timeline thumbnails (not supported: 400)
 
 Hikvision side: ISAPI dailyDistribution + ContentMgmt/search, and RTSP
@@ -39,7 +44,9 @@ log = logging.getLogger("playback")
 
 MSG_FILE_OPEN, MSG_FILE_LIST, MSG_FILE_CLOSE = 14, 15, 16
 MSG_HDD, MSG_DAY_RECORDS, MSG_COVER = 102, 142, 298
-MSG_REPLAY, MSG_REPLAY_STOP = 381, 382
+MSG_REPLAY, MSG_REPLAY_STOP, MSG_REPLAY_SEEK = 381, 382, 383
+MAX_REPLY_BYTES = 36000
+LIST_CACHE_SECONDS = 30
 
 # Hikvision recordType metadata -> Reolink recordType
 HIK_RECORD_TYPES = {"timing": "sched", "motion": "md", "manual": "manual", "alarm": "io",
@@ -176,6 +183,7 @@ class HikRecordings:
     def __init__(self, http: HikHttp, track: int = 101) -> None:
         self.http, self.track = http, track
         self._offset: tuple[float, dt.timedelta] | None = None   # (monotonic, UTC offset)
+        self._lists: dict[tuple, tuple[float, list[Segment]]] = {}    # full searches, see search()
 
     async def utc_offset(self) -> dt.timedelta:
         """Camera's current UTC offset (DST aware, refreshed every 10 minutes)."""
@@ -208,7 +216,12 @@ class HikRecordings:
                 if (d.findtext("record") or "").strip().lower() == "true"}
 
     async def search(self, start: dt.datetime, end: dt.datetime, limit: int = 1000) -> list[Segment]:
-        """Recordings overlapping [start, end] (camera-local), in local time."""
+        """Recordings overlapping [start, end] (camera-local), in local time, oldest first.
+        Full lists take several requests and the app asks again on every visit: kept for a moment."""
+        key = (start, end, limit)
+        cached = self._lists.get(key)
+        if limit > 1 and cached and time.monotonic() - cached[0] < LIST_CACHE_SECONDS:
+            return cached[1]
         out: list[Segment] = []
         sid = str(uuid.uuid4())
         off = await self.utc_offset()
@@ -217,7 +230,8 @@ class HikRecordings:
                     f"<trackList><trackID>{self.track}</trackID></trackList>"
                     f"<timeSpanList><timeSpan><startTime>{_hik_time(start - off)}</startTime>"
                     f"<endTime>{_hik_time(end - off)}</endTime></timeSpan></timeSpanList>"
-                    f"<maxResults>100</maxResults><searchResultPostion>{len(out)}</searchResultPostion>"
+                    f"<maxResults>{min(100, limit - len(out))}</maxResults>"
+                    f"<searchResultPostion>{len(out)}</searchResultPostion>"
                     "<metadataList><metadataDescriptor>//recordType.meta.std-cgi.com</metadataDescriptor>"
                     "</metadataList></CMSearchDescription>").encode()
             status, data = await self.http.post_bytes("/ISAPI/ContentMgmt/search", body)
@@ -235,6 +249,8 @@ class HikRecordings:
                                    HIK_RECORD_TYPES.get(meta, "sched")))
             if (root.findtext("responseStatusStrg") or "").upper() != "MORE" or not items:
                 break
+        if limit > 1:
+            self._lists = {key: (time.monotonic(), out)}
         return out
 
     async def replay_url(self, live_rtsp: str, start: dt.datetime, end: dt.datetime) -> str:
@@ -324,6 +340,18 @@ def merge_segments(segs: list[Segment], start: dt.datetime, end: dt.datetime,
         if len(out) <= max_items:
             break
     return out
+
+
+def file_list_limited(handle: int, stream: str, segs: list[Segment], start: dt.datetime,
+                      end: dt.datetime) -> tuple[str, int]:
+    """15 reply: (xml, entries). The app hangs on a reply over ~40 KB (real cameras never send
+    a message above 39488 bytes), so the list is merged further until it fits with room to spare."""
+    for cap in (60, 50, 40, 30, 20, 10):
+        merged = merge_segments(segs, start, end, max_items=cap)
+        xml = file_list_xml(handle, stream, merged)
+        if len(xml.encode()) <= MAX_REPLY_BYTES:
+            break
+    return xml, len(merged)
 
 
 def months_between(start: dt.date, end: dt.date) -> list[tuple[int, int]]:
