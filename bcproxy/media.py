@@ -5,6 +5,7 @@ import asyncio
 import collections
 import json
 import logging
+import os
 import time
 from dataclasses import dataclass
 
@@ -21,19 +22,57 @@ class StreamInfo:
     fps: int = 25
 
 
-def _input_opts(url: str, probe: bool = False) -> list[str]:
+def _ffconcat(url: str, options: dict[str, str]) -> str:
+    quoted = url.replace("'", "'\\''")
+    return "\n".join(["ffconcat version 1.0", f"file '{quoted}'",
+                      *(f"option {k} {v}" for k, v in options.items())]) + "\n"
+
+
+def _secret_fd(url: str, options: dict[str, str]) -> int | None:
+    """An in-memory ffconcat file naming the URL, so that the password stays off the command line:
+    any process can read that, and UniFi OS copies `ps` into the crash reports it uploads. ffmpeg
+    only takes RTSP credentials in the URL. None when the URL holds no secret or there is no memfd
+    (Windows)."""
+    if "@" not in url or not hasattr(os, "memfd_create"):
+        return None
+    try:
+        fd = os.memfd_create("bcproxy-source", 0)    # 0: not close-on-exec
+    except OSError:
+        return None
+    os.write(fd, _ffconcat(url, options).encode())
+    return fd
+
+
+async def _spawn(tool: str, head: list[str], url: str, tail: list[str], *, rtsp: dict[str, str] | None = None,
+                 file_args: tuple[str, ...] = ()) -> asyncio.subprocess.Process:
+    """Runs ffmpeg or ffprobe on url: `tool *head <input> *tail`."""
+    extra: dict = {}
+    fd = None
     if url.startswith("rtsp"):
-        return ["-rtsp_transport", "tcp"]
-    # local file (testing): loop it in real time
-    return [] if probe else ["-re", "-stream_loop", "-1"]
+        options = {"rtsp_transport": "tcp", **(rtsp or {})}
+        fd = _secret_fd(url, options)
+        if fd is None:
+            source = [a for k, v in options.items() for a in (f"-{k}", v)] + ["-i", url]
+        else:
+            source = ["-f", "concat", "-safe", "0", "-protocol_whitelist", "file,rtsp,rtp,tcp,udp,crypto",
+                      "-i", f"/proc/self/fd/{fd}"]
+            extra["pass_fds"] = (fd,)
+    else:
+        source = [*file_args, "-i", url]
+    try:
+        return await asyncio.create_subprocess_exec(
+            tool, *head, *source, *tail,
+            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE, **extra)
+    finally:
+        if fd is not None:
+            os.close(fd)
 
 
 async def probe(url: str, ffprobe: str = "ffprobe", timeout: float = 15) -> StreamInfo:
-    proc = await asyncio.create_subprocess_exec(
-        ffprobe, "-v", "error", *_input_opts(url, probe=True), "-select_streams", "v:0",
-        "-show_entries", "stream=codec_name,width,height,avg_frame_rate,r_frame_rate",
-        "-of", "json", url,
-        stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
+    proc = await _spawn(
+        ffprobe, ["-v", "error"], url,
+        ["-select_streams", "v:0", "-show_entries", "stream=codec_name,width,height,avg_frame_rate,r_frame_rate",
+         "-of", "json"])
     try:
         out, err = await asyncio.wait_for(proc.communicate(), timeout)
     except asyncio.TimeoutError:
@@ -61,10 +100,9 @@ async def read_access_units(url: str, codec: str, ffmpeg: str = "ffmpeg", first_
     """One-shot ffmpeg (playback): yields AccessUnits until the source ends. Hikvision playback
     neither sends more nor hangs up at the end of its time range, so a silent source also counts as
     ended. (No -fflags nobuffer / small -probesize: measured, they give no picture at all here.)"""
-    proc = await asyncio.create_subprocess_exec(
-        ffmpeg, "-hide_banner", "-loglevel", "error", *_input_opts(url, probe=True), "-i", url,
-        "-map", "0:v:0", "-c:v", "copy", "-f", "h264" if codec == "H264" else "hevc", "pipe:1",
-        stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
+    proc = await _spawn(
+        ffmpeg, ["-hide_banner", "-loglevel", "error"], url,
+        ["-map", "0:v:0", "-c:v", "copy", "-f", "h264" if codec == "H264" else "hevc", "pipe:1"])
     parser = AnnexBParser(codec)
     timeout = first_timeout
     try:
@@ -169,12 +207,11 @@ class AudioSource:
             self._task = None
 
     async def _run(self) -> None:
-        src = ["-rtsp_transport", "tcp", "-allowed_media_types", "audio"] if self.url.startswith("rtsp") else ["-re"]
         while self.subs:
-            proc = await asyncio.create_subprocess_exec(
-                self.ffmpeg, "-hide_banner", "-loglevel", "error", *src, "-i", self.url, "-vn",
-                "-map", "0:a:0", "-c:a", "aac", "-b:a", "32k", "-ar", "16000", "-ac", "1", "-f", "adts", "pipe:1",
-                stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
+            proc = await _spawn(
+                self.ffmpeg, ["-hide_banner", "-loglevel", "error"], self.url,
+                ["-vn", "-map", "0:a:0", "-c:a", "aac", "-b:a", "32k", "-ar", "16000", "-ac", "1", "-f", "adts", "pipe:1"],
+                rtsp={"allowed_media_types": "audio"}, file_args=("-re",))
             buf = bytearray()
             try:
                 assert proc.stdout
@@ -256,10 +293,10 @@ class StreamSource:
         info = await self.ensure_info()
         fmt = "h264" if info.codec == "H264" else "hevc"
         while self.subs:
-            proc = await asyncio.create_subprocess_exec(
-                self.ffmpeg, "-hide_banner", "-loglevel", "error", *_input_opts(self.url),
-                "-i", self.url, "-map", "0:v:0", "-c:v", "copy", "-f", fmt, "pipe:1",
-                stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
+            # local file (testing): loop it in real time
+            proc = await _spawn(
+                self.ffmpeg, ["-hide_banner", "-loglevel", "error"], self.url,
+                ["-map", "0:v:0", "-c:v", "copy", "-f", fmt, "pipe:1"], file_args=("-re", "-stream_loop", "-1"))
             parser = AnnexBParser(info.codec)
             log.info("%s: ffmpeg started (pid %s)", self.name, proc.pid)
             try:

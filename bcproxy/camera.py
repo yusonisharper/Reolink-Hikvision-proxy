@@ -221,6 +221,11 @@ class VirtualCamera:
         while not await self._load_hik():
             await asyncio.sleep(interval)
 
+    def failed_tasks(self) -> list[asyncio.Task]:
+        """Background tasks that ended with an exception. They stay referenced here, so asyncio
+        never reports them by itself."""
+        return [t for t in self._tasks if t.done() and not t.cancelled() and t.exception()]
+
     async def stop(self) -> None:
         for t in self._tasks:
             t.cancel()

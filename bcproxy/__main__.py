@@ -4,11 +4,13 @@ from __future__ import annotations
 import argparse
 import asyncio
 import logging
+import os
 import signal
+import sys
 
-from . import discovery, hik
+from . import discovery, hik, logsetup, watchdog
 from .camera import VirtualCamera
-from .config import load
+from .config import AppConfig, load
 from .session import BcSession
 
 log = logging.getLogger("main")
@@ -32,8 +34,8 @@ async def start_camera(cam: VirtualCamera, trace: bool, servers: list) -> None:
              cc.name, cc.listen_host, cc.listen_port, cam.vendor_label, cc.hik_host or "-")
 
 
-async def main_async(cfg_path: str, trace: bool | None) -> None:
-    cfg = load(cfg_path)
+async def main_async(cfg: AppConfig, trace: bool | None) -> bool:
+    """Returns True when a restart is needed."""
     if trace is not None:
         cfg.trace = trace
     cams = [VirtualCamera(cc, cfg.templates_dir, cfg.unknown_reply, cfg.state_dir) for cc in cfg.cameras]
@@ -67,13 +69,16 @@ async def main_async(cfg_path: str, trace: bool | None) -> None:
             loop.add_signal_handler(sig, stop.set)
         except NotImplementedError:
             pass
-    await stop.wait()
+    watchdog.notify("READY=1")
+    restart = await watchdog.supervise(cams, stop)
+    watchdog.notify("STOPPING=1")
     for t in starting:
         t.cancel()
     for s in servers:
         s.close()
     for c in cams:
         await c.stop()
+    return restart
 
 
 def main() -> None:
@@ -82,11 +87,27 @@ def main() -> None:
     ap.add_argument("-v", "--verbose", action="store_true", help="debug logging")
     ap.add_argument("--trace", action="store_true", default=None,
                     help="log every decrypted Baichuan message (for building templates)")
+    ap.add_argument("--log-dir", help="also write rotating log files here (bcproxy.log, errors.log, crash.log)")
     a = ap.parse_args()
-    from .config import load as _load
-    level = "debug" if (a.verbose or a.trace) else _load(a.config).log_level
-    logging.basicConfig(level=level.upper(), format="%(asctime)s %(levelname)-7s %(name)s: %(message)s")
-    asyncio.run(main_async(a.config, a.trace))
+    # logging comes first, so that a broken config.yaml ends up in the log files too
+    logsetup.setup("debug" if (a.verbose or a.trace) else "info", a.log_dir)
+    log.info("starting, pid %d, python %s", os.getpid(), sys.version.split()[0])
+    try:
+        cfg = load(a.config)
+    except Exception:
+        log.critical("cannot load %s", a.config, exc_info=True)
+        sys.exit(2)
+    if not (a.verbose or a.trace):
+        logging.getLogger().setLevel(cfg.log_level.upper())
+    try:
+        restart = asyncio.run(main_async(cfg, a.trace))
+    except Exception:
+        log.critical("fatal error", exc_info=True)
+        sys.exit(1)
+    if restart:
+        log.error("exiting so that systemd restarts the service")
+        sys.exit(1)
+    log.info("stopped")
 
 
 if __name__ == "__main__":

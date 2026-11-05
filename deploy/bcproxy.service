@@ -1,0 +1,40 @@
+[Unit]
+Description=Reolink (Baichuan) proxy for Hikvision and Dahua cameras
+Wants=network-online.target
+After=network-online.target
+RequiresMountsFor=/data
+# never give up restarting: cameras must come back without anybody looking at the device
+StartLimitIntervalSec=0
+
+[Service]
+Type=notify
+NotifyAccess=main
+WorkingDirectory=/data/bcproxy
+Environment=PATH=/data/bcproxy/bin:/usr/sbin:/usr/bin:/sbin:/bin
+Environment=PYTHONPATH=/data/bcproxy/app
+ExecStart=/data/bcproxy/python/bin/python3 -m bcproxy -c /data/bcproxy/config.yaml --log-dir /data/bcproxy/logs
+ExecStopPost=/bin/sh /data/bcproxy/app/deploy/on-exit.sh
+
+Restart=always
+RestartSec=10
+# bcproxy/watchdog.py beats every 30 s; on silence systemd sends SIGABRT, crash.log gets the stack
+WatchdogSec=60
+TimeoutStartSec=60
+TimeoutStopSec=30
+# ffmpeg children must go along with the proxy
+KillMode=control-group
+
+# Logs and config hold camera details: root only
+UMask=0077
+LimitNOFILE=4096
+# The stack goes to crash.log. Exactly 1: core_pattern here pipes to ubnt_report_handler, which
+# queues a report for upload. The kernel ignores a limit of 0 for pipes, and skips them at 1.
+LimitCORE=1
+# Share the device with UniFi Protect: under memory pressure earlyoom should pick the proxy, which
+# restarts by itself, before anything that records. All 8 cameras with main and sub streams
+# measured 128 MB including page cache.
+OOMScoreAdjust=300
+MemoryMax=512M
+
+[Install]
+WantedBy=multi-user.target

@@ -1,3 +1,6 @@
 # test samples are raw protocol captures: never convert line endings
 *.bin binary
 *.raw binary
+# run on Linux, also when pushed from a Windows checkout
+*.sh text eol=lf
+*.service text eol=lf

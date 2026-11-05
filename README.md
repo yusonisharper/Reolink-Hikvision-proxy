@@ -180,6 +180,50 @@ python tools/bc_client.py 127.0.0.1 -p change-me --preview subStream --out sub.h
 - 本机运行 Reolink Client 时，它会占用 UDP 3000，此时 `tools/bc_discover.py` 无法运行（代理本身不受影响）。
 - 保存完整日志：`python -m bcproxy -c config.yaml -v *> log.txt`
 
+## 部署到 UniFi Cloud Key Gen2 Plus
+
+在 UCK-G2-Plus（UniFi OS 6.0.11，Debian 13，aarch64）上验证。全部文件都在 `/data/bcproxy`，开机由 systemd 启动。首次安装（Git Bash，在 `~/.ssh/config` 里配好 `UCK-G2-Plus`）：
+
+```bash
+deploy/push.sh --with-config      # 复制代码、config.yaml、state/，下载 Python 和 ffmpeg，启动服务
+deploy/push.sh                    # 以后更新代码：不动设备上的配置和 state/
+```
+
+NVR 添加摄像头时填 Cloud Key 的 IP，端口是 `listen` 里的端口。
+
+**日志**（`/data/bcproxy/logs/`，自动轮转，每种最多 6 个 5 MB 的文件）：
+
+| 文件 | 内容 |
+|---|---|
+| `errors.log` | WARNING 及以上，排查问题先看这里 |
+| `bcproxy.log` | 全部日志，级别由 `log_level` 决定 |
+| `crash.log` | 致命信号时的 Python 调用栈，含看门狗杀进程时卡住的位置 |
+| `restarts.log` | 每次退出的原因：`result=watchdog`、`oom-kill`、`exit-code` 等 |
+
+RTSP 地址和 XML 里的密码写入前会替换成 `***`。
+
+**诊断上传：** UniFi OS 每小时把 `/persistent/report/` 里的报告传给 Ubiquiti，设备上任何进程崩溃时生成的报告都带完整的 `ps`。所以 ffmpeg 的 RTSP 地址（含密码）不放在命令行，而是放进 memfd 里的 ffconcat 文件。`LimitCORE=1` 让代理自己崩溃时不生成报告（0 不行，内核对管道型 `core_pattern` 不看 0）。
+
+常用命令：
+
+```bash
+systemctl status bcproxy
+tail -f /data/bcproxy/logs/errors.log
+journalctl -u bcproxy -b
+```
+
+**看门狗：** `Type=notify` + `WatchdogSec=60`。心跳在事件循环里发送，循环卡住 60 秒，或摄像头的后台任务（事件流等）异常退出，服务都会被重启。任何原因退出都在 10 秒后重启，且不限次数。
+
+**固件升级：** 升级时 `overlay_cleanup`（`/usr/share/initramfs-tools/scripts/ubnt-init/apq8053/boot-emmc`）会删除 `/usr`、`/lib`、`/var`（`var/log` 除外）和部分 `/etc`，保留 `/data` 和 `/etc/systemd/system` 里的服务文件。所以这里不用 apt，也不用固件自带的 Python。`ubnt-dpkg-restore` 只恢复官方白名单里的包，打成 deb 没有用。
+
+这份清单是固件脚本的一部分，以后可能变。升级后检查 `systemctl is-enabled bcproxy`；如果服务没了，运行下面的命令恢复，它不需要联网：
+
+```bash
+sh /data/bcproxy/app/deploy/install.sh
+```
+
+**恢复出厂设置会清空 `/data`**，只能重新运行 `deploy/push.sh --with-config`。`config.yaml` 要在 PC 上留一份；设备上的 `state/` 需要时自己备份。
+
 ## 用真机数据补全未适配的消息
 
 1. 用真 Reolink 摄像头导出回复：
@@ -208,7 +252,10 @@ bcproxy/
   events.py     事件状态机 + <AlarmEventList> 生成
   hik.py        ISAPI：Digest 认证、alertStream、multipart 解析、告警映射、HTTP 推送接收
   media.py      ffprobe/ffmpeg 拉 RTSP，多观看者共享一个 ffmpeg，码率统计
+  logsetup.py   控制台和轮转日志文件，写入前去掉密码
+  watchdog.py   systemd 就绪通知和看门狗心跳，检查后台任务是否还活着
   templates/    内置回复模板（可被 templates_dir 覆盖）
+deploy/         Cloud Key 部署：systemd 服务、设备上的安装脚本、PC 上的推送脚本
 tools/
   bc_client.py  Baichuan 客户端（测试代理 / 从真机导出模板）
   bc_dump.py    pcap/pcapng 解密工具
