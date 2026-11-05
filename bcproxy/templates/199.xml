@@ -4,8 +4,8 @@
 <diskNum>${disk_num}</diskNum>
 <channelNum>1</channelNum>
 <audioNum>1</audioNum>
-<ptzMode>none</ptzMode>
-<ptzCfg>0</ptzCfg>
+<ptzMode>${ptz_mode}</ptzMode>
+<ptzCfg>${ptz_on}</ptzCfg>
 <B485>0</B485>
 <autoUpdate>0</autoUpdate>
 <pushAlarm>1</pushAlarm>
@@ -52,7 +52,7 @@
 <IOTLinkActionMax>0</IOTLinkActionMax>
 <item>
 <chnID>0</chnID>
-<ptzType>0</ptzType>
+<ptzType>${ptz_type}</ptzType>
 <rfCfg>0</rfCfg>
 <noAudio>${no_audio}</noAudio>
 <autoFocus>0</autoFocus>
@@ -64,10 +64,10 @@
 <dynamicReso>1</dynamicReso>
 <audioVersion>${audio_version}</audioVersion>
 <ledCtrl>${led_ctrl}</ledCtrl>
-<ptzControl>0</ptzControl>
+<ptzControl>${ptz_on}</ptzControl>
 <newIspCfg>87811</newIspCfg>
-<ptzPreset>0</ptzPreset>
-<ptzPatrol>0</ptzPatrol>
+<ptzPreset>${ptz_preset}</ptzPreset>
+<ptzPatrol>${ptz_patrol}</ptzPatrol>
 <ptzTattern>0</ptzTattern>
 <autoPt>0</autoPt>
 <h264Profile>7</h264Profile>

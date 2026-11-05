@@ -5,7 +5,7 @@
 <abilityValue>general_rw, norm_rw, version_ro, ${uid_ability}autoReboot_rw, restore_rw, reboot_rw, shutdown_rw, dst_rw, log_ro, performance_ro, upgrade_rw, export_rw, import_rw, bootPwd_rw</abilityValue>
 </subModule>
 </system>
-${record_ability}<network>
+${record_ability}${ptz_ability}<network>
 <subModule>
 <abilityValue>port_rw, dns_rw, email_rw, ftp_rw, ftpSchedule_rw, ipFilter_rw, localLink_rw, pppoe_rw, upnp_rw, ntp_rw, netStatus_rw, ${p2p_ability}autontp_rw</abilityValue>
 </subModule>

@@ -67,12 +67,12 @@ TYPE_RANK = ["people", "vehicle", "dog_cat", "face", "crossline", "intrusion", "
 
 
 def join_types(*types: str) -> str:
-    """Union of recordType values, most specific first. "people,intrusion" lets
-    a clip match both app filters; generic md/sched only stay when alone."""
+    """Union of recordType values, most specific first. "people,intrusion,md" lets a clip match
+    every app filter, motion too: a person is motion as well. sched only stays when alone."""
     parts = {p for t in types for p in t.split(",") if p}
     rank = lambda t: TYPE_RANK.index(t) if t in TYPE_RANK else len(TYPE_RANK)  # noqa: E731
-    specific = sorted(parts - {"md", "io", "manual", "sched"}, key=rank)
-    return ",".join(specific) if specific else min(parts, key=rank)
+    events = sorted(parts - {"sched"}, key=rank)
+    return ",".join(events) if events else "sched"
 
 
 class EventJournal:
@@ -287,7 +287,8 @@ def day_records_xml(start: dt.datetime, end: dt.datetime, days: list[dt.date]) -
 def file_open_xml(handle: int, start: dt.datetime, end: dt.datetime) -> str:
     return ('<FileInfoList version="1.1">\n<FileInfo>\n<channelId>0</channelId>\n'
             f"<handle>{handle}</handle>\n<name></name>\n<containsAudio>0</containsAudio>\n"
-            "<fileType>h264</fileType>\n<recordType>manual,io,md,sched,people,vehicle,face,other,dog_cat</recordType>\n"
+            "<fileType>h264</fileType>\n<recordType>manual,io,md,sched,people,vehicle,face,other,dog_cat,"
+            "crossline,intrusion,loitering</recordType>\n"
             "<supportSub>1</supportSub>\n<sizeL>0</sizeL>\n<sizeH>0</sizeH>\n"
             + time_xml("startTime", start) + time_xml("endTime", end) + "</FileInfo>\n</FileInfoList>")
 

@@ -7,14 +7,15 @@ import logging
 import os
 import time
 from string import Template
+from xml.sax.saxutils import escape as xml_escape
 
 from . import bc, bcmedia
 from . import playback as pb
-from . import hikcfg
 from . import settings as st
 from .bc import BcMsg, body_xml, ext_xml, xml_value
 from .camera import VirtualCamera
 from .crypto import Crypter, Enc, login_hash, make_aes_key
+from .dahua import PTZ_CODES, ZOOM_MAX, to_dahua_speed
 from .events import Snapshot, alarm_event_xml
 from .media import read_access_units
 from .templates import SMART_MSG, smart_detect_xml
@@ -23,7 +24,7 @@ log = logging.getLogger("bc")
 
 MEDIA_CHUNK = 32 * 1024
 # Real cameras answer these with an empty 200 too (192: seen in a neolink capture;
-# 287: TimeCfg write from the app - Hikvision keeps its own NTP time).
+# 287: TimeCfg write from the app - the source camera keeps its own NTP time).
 QUIET_OK = {192, 287}
 # What a real camera (dual-lens RLC, app capture) answers for features it lacks.
 ERROR_REPLY = {257: 400, 789: 405, 818: 405}
@@ -38,8 +39,28 @@ MSG_IMAGE_SET, MSG_IMAGE, MSG_IMAGE_RANGES, MSG_PORTS, MSG_PORTS_SET = 25, 26, 1
 MSG_TAMPER, MSG_TAMPER_SET = 763, 764
 CONTROL_IDS = {MSG_RECORD_CFG, MSG_RECORD_CFG_SET, MSG_COMPRESSION_SET, MSG_RECORD, MSG_RECORD_SET, MSG_LIGHT_MANUAL,
                MSG_IMAGE_SET, MSG_IMAGE, MSG_IMAGE_RANGES, MSG_PORTS, MSG_PORTS_SET, MSG_TAMPER, MSG_TAMPER_SET}
+MSG_PTZ_CONTROL, MSG_PTZ_PRESET, MSG_PTZ_PRESETS, MSG_ZOOM_FOCUS, MSG_ZOOM_FOCUS_SET = 18, 19, 190, 294, 295
+PTZ_IDS = {MSG_PTZ_CONTROL, MSG_PTZ_PRESET, MSG_PTZ_PRESETS, MSG_ZOOM_FOCUS, MSG_ZOOM_FOCUS_SET}
+# Patrol read: 64 is what the app sends with 294 and 190 on opening its PTZ panel, and with an empty reply
+# the panel says "failed to load" (seen in a real session). Writes are recognized by their <PtzCruise>.
+MSG_CRUISE_READS = {64}
+PTZ_DEFAULT_SPEED = 32
+FOCUS_MAX = 1000
 PLAYBACK_IDS = {pb.MSG_HDD, pb.MSG_DAY_RECORDS, pb.MSG_FILE_OPEN, pb.MSG_FILE_LIST, pb.MSG_FILE_CLOSE,
                 pb.MSG_COVER, pb.MSG_REPLAY, pb.MSG_REPLAY_STOP, pb.MSG_REPLAY_SEEK}
+
+
+def cruise_xml(tours: list[dict]) -> str:
+    """<PtzCruise>, field order as the Reolink Client SDK writes it. Dahua speed 1-8 -> Reolink 1-64.
+    The app's patrolId counts from 0 (seen in its saves and starts), Dahua's tour from 1."""
+    items = ""
+    for t in tours:
+        points = "".join(f"<keyPos>\n<keyPosId>{i}</keyPosId>\n<presetId>{p['preset']}</presetId>\n"
+                         f"<speed>{p['speed'] * 8}</speed>\n<dwellTime>{p['dwell']}</dwellTime>\n</keyPos>\n"
+                         for i, p in enumerate(t["points"]))
+        items += (f"<cruise>\n<patrolId>{t['id'] - 1}</patrolId>\n<enable>{1 if t['enable'] else 0}</enable>\n"
+                  f"<name>{xml_escape(t['name'])}</name>\n<keyPosList>\n{points}</keyPosList>\n</cruise>\n")
+    return f'<PtzCruise version="1.1">\n<channelId>0</channelId>\n<cruiseList>\n{items}</cruiseList>\n</PtzCruise>'
 
 
 class BcSession:
@@ -56,6 +77,8 @@ class BcSession:
         self.username = ""
         self.alarm_req: BcMsg | None = None
         self.previews: dict[int, asyncio.Task] = {}
+        self.work_queue: asyncio.Queue | None = None  # requests after login, in order
+        self.ptz_queue: asyncio.Queue | None = None   # PTZ messages, in order, apart from slow requests
         self.searches: dict[int, tuple[dt.datetime, dt.datetime, str]] = {}   # record search handles
         self.next_handle = 0
         self.replay: asyncio.Task | None = None
@@ -113,7 +136,7 @@ class BcSession:
                         log.debug("%s << id=%d ch=%d num=%d resp=%#x cls=%#x\n%s%s", self.tag,
                                   msg.msg_id, msg.channel, msg.msg_num, msg.response, msg.cls,
                                   msg.ext_text, msg.payload_text)
-                    await self.dispatch(msg)
+                    await self.route(msg)
         except (ConnectionError, asyncio.IncompleteReadError) as e:
             reason = f"{type(e).__name__}: {e}"
         except asyncio.CancelledError:
@@ -131,12 +154,43 @@ class BcSession:
             log.info("%s: closing: %s (logged_in=%s)", self.tag, reason, self.logged_in)
             self.cam.alarm_subs.discard(self)
             self.cam.sessions.discard(self)
+            self.cam.ptz_release(self)
             for t in list(self.previews.values()) + list(self.tasks):
                 t.cancel()
             self.writer.close()
             log.info("%s: disconnected", self.tag)
 
     # -------------------------------------------------------------- dispatch
+    async def route(self, msg: BcMsg) -> None:
+        """Keep reading while requests are served: a released PTZ button must stop now, not after
+        a month of record search. Login stays inline, decrypting the next message depends on it.
+        Each queue keeps its own order; replies carry the request's number, so they may cross."""
+        if msg.msg_id == bc.MSG_LOGIN or not self.logged_in:
+            await self.dispatch(msg)
+        elif self.cam.hikcfg and self.cam.hikcfg.ptz_type and (
+                msg.msg_id in PTZ_IDS or msg.msg_id in MSG_CRUISE_READS
+                or (not msg.binary and b"<PtzCruise" in msg.payload)):
+            if self.ptz_queue is None:
+                self.ptz_queue = asyncio.Queue()
+                self._spawn(self._serve(self.ptz_queue, self.on_ptz))
+            self.ptz_queue.put_nowait(msg)
+        else:
+            if self.work_queue is None:
+                self.work_queue = asyncio.Queue()
+                self._spawn(self._serve(self.work_queue, self.dispatch))
+            self.work_queue.put_nowait(msg)
+
+    async def _serve(self, queue: asyncio.Queue, handler) -> None:
+        try:
+            while True:
+                await handler(await queue.get())
+        except (ConnectionError, asyncio.IncompleteReadError) as e:
+            log.info("%s: closing: %s: %s", self.tag, type(e).__name__, e)
+            self.writer.close()
+        except Exception:  # noqa: BLE001 - never die silently
+            log.exception("%s: session crashed", self.tag)
+            self.writer.close()
+
     async def dispatch(self, msg: BcMsg) -> None:
         if msg.msg_id == bc.MSG_LOGIN:
             await self.on_login(msg)
@@ -158,7 +212,7 @@ class BcSession:
         if self.cam.recordings and msg.msg_id in PLAYBACK_IDS:
             await self.on_playback(msg)
             return
-        if self.cam.hikcfg and msg.msg_id in CONTROL_IDS:
+        if self.cam.hikcfg and msg.msg_id in CONTROL_IDS - self.cam.hikcfg.unhandled_msgs:
             await self.on_control(msg)
             return
         if msg.msg_id in SMART_MSG and not self.cam.templates.has(msg.msg_id):
@@ -311,7 +365,7 @@ class BcSession:
             '<FloodlightStatusList version="1.1">\n<FloodlightStatus>\n<channel>0</channel>\n'
             f"<status>{1 if on else 0}</status>\n</FloodlightStatus>\n</FloodlightStatusList>"))))
 
-    # ------------------------------------------------- settings that reach Hikvision
+    # ------------------------------------------------- settings that reach the source camera
     async def on_control(self, msg: BcMsg) -> None:
         mid, cfg = msg.msg_id, self.cam.hikcfg
         try:
@@ -326,7 +380,7 @@ class BcSession:
                 await self.send(msg.reply(200, payload=await cfg.image_xml(template, self.cam.frame_rate_mode)))
             elif mid == MSG_IMAGE_SET:
                 changed = await cfg.apply_image(msg.payload)
-                log.info("%s: image written to Hikvision: %s", self.tag, changed or "no change")
+                log.info("%s: image written to camera: %s", self.tag, changed or "no change")
                 rate = xml_value(msg.payload, "constantFrameRate")
                 if rate is not None:
                     self.cam.set_frame_rate_mode(int(rate))
@@ -338,24 +392,24 @@ class BcSession:
             elif mid == MSG_TAMPER_SET:
                 on = xml_value(msg.payload, "enable") == "1"
                 await cfg.set_tamper(on)
-                log.info("%s: Hikvision tamper detection %s", self.tag, "on" if on else "off")
+                log.info("%s: camera tamper detection %s", self.tag, "on" if on else "off")
                 await self.send(msg.reply(200))
             elif mid == MSG_PORTS:
                 await self.send(msg.reply(200, payload=body_xml(await cfg.server_ports_xml(self.cam.cfg.listen_port))))
             elif mid == MSG_PORTS_SET:
                 changed = await cfg.set_server_ports(msg.payload, self.cam.cfg.listen_port)
-                log.info("%s: server ports written to Hikvision: %s", self.tag, changed or "no change")
+                log.info("%s: server ports written to camera: %s", self.tag, changed or "no change")
                 await self.send(msg.reply(200))
             elif mid == MSG_RECORD:
-                doc = self.cam.settings.get(MSG_RECORD) or body_xml(hikcfg.record_xml(
-                    await cfg.track(), [t for t in ("people", "vehicle", "dog_cat") if t in self.cam.cfg.ai_types]))
+                doc = self.cam.settings.get(MSG_RECORD) or body_xml(await cfg.record_xml(
+                    [t for t in ("people", "vehicle", "dog_cat") if t in self.cam.cfg.ai_types]))
                 await self.send(msg.reply(200, payload=doc))
             elif mid == MSG_RECORD_SET:
                 root = st._body(msg.payload).find("Record")
                 tables = {i.findtext("type"): i.findtext("valueTable") or "" for i in root.iter("item")}
                 await cfg.set_schedule(root.findtext("enable") != "0", tables)
                 self.cam.settings.put(MSG_RECORD, msg.payload)
-                log.info("%s: record schedule written to Hikvision", self.tag)
+                log.info("%s: record schedule written to camera", self.tag)
                 await self.send(msg.reply(200))
             elif mid == MSG_RECORD_CFG:
                 await self.send(msg.reply(200, payload=body_xml(await cfg.record_cfg_xml())))
@@ -363,9 +417,86 @@ class BcSession:
                 num = lambda t: int(v) if (v := xml_value(msg.payload, t)) else None  # noqa: E731
                 await cfg.set_record_cfg(num("cycle"), num("recordDelayTime"), num("preRecordTime"))
                 await self.send(msg.reply(200))
-        except Exception as e:  # noqa: BLE001 - Hikvision refused, bad request: tell the app
+        except Exception as e:  # noqa: BLE001 - camera refused, bad request: tell the app
             log.warning("%s: msg %d failed: %s", self.tag, mid, e)
             await self.send(msg.reply(400))
+
+    # ------------------------------------------------------------------- PTZ
+    async def on_ptz(self, msg: BcMsg) -> None:
+        """Formats from neolink and the Reolink Client SDK's XML builders (no capture of the app).
+        Anything not understood is logged in full: that log is how to add it."""
+        mid, cfg = msg.msg_id, self.cam.hikcfg
+        try:
+            if b"<PtzCruise" in msg.payload:
+                await self._save_patrols(msg)
+            elif mid in MSG_CRUISE_READS:
+                await self.send(msg.reply(200, payload=body_xml(cruise_xml(await cfg.ptz_tours()))))
+            elif mid == MSG_PTZ_CONTROL:
+                command = (xml_value(msg.payload, "command") or "").lower()
+                patrol = xml_value(msg.payload, "patrolId")
+                if command == "stop":
+                    await self.cam.ptz_stop()
+                elif command == "startpatrol" and cfg.has_tours:
+                    await self.cam.ptz_tour_start(int(patrol or 0) + 1)
+                    log.info("%s: patrol %s started", self.tag, patrol or 0)
+                elif command == "stoppatrol" and cfg.has_tours:
+                    await self.cam.ptz_tour_stop(int(patrol) + 1 if patrol else None)
+                    log.info("%s: patrol %s stopped", self.tag, patrol or "-")
+                elif command in PTZ_CODES:
+                    speed = float(xml_value(msg.payload, "speed") or PTZ_DEFAULT_SPEED)
+                    await self.cam.ptz_start(self, PTZ_CODES[command], to_dahua_speed(speed))
+                else:
+                    raise ValueError(f"unknown PTZ command\n{msg.payload_text}")
+                await self.send(msg.reply(200))
+            elif mid == MSG_PTZ_PRESETS:
+                items = "" if not cfg.has_presets else "".join(
+                    f"<preset>\n<id>{i}</id>\n<name>{xml_escape(name)}</name>\n</preset>\n"
+                    for i, name in await cfg.ptz_presets())
+                await self.send(msg.reply(200, payload=body_xml(
+                    f'<PtzPreset version="1.1">\n<channelId>0</channelId>\n<presetList>\n{items}</presetList>\n'
+                    "</PtzPreset>")))
+            elif mid == MSG_PTZ_PRESET:
+                command, preset = xml_value(msg.payload, "command"), xml_value(msg.payload, "id")
+                if not preset:
+                    raise ValueError(f"no preset id\n{msg.payload_text}")
+                if command == "toPos":
+                    await self.cam.ptz_goto(int(preset))
+                elif command == "setPos":
+                    preset = await cfg.ptz_preset_save(int(preset), xml_value(msg.payload, "name"))
+                elif command == "delPos":
+                    await cfg.ptz_preset_delete(int(preset))
+                else:
+                    raise ValueError(f"preset action not supported\n{msg.payload_text}")
+                log.info("%s: PTZ preset %s: %s", self.tag, preset, command)
+                await self.send(msg.reply(200))
+            elif mid == MSG_ZOOM_FOCUS:
+                zoom, focus = await cfg.zoom_focus()
+                # the camera's focus position has no documented top: seen at 585 and at 4680
+                zoom, focus = max(0, min(zoom, ZOOM_MAX)), max(0, min(focus, FOCUS_MAX))
+                await self.send(msg.reply(200, payload=body_xml(
+                    f'<PtzZoomFocus version="1.1">\n<channelId>0</channelId>\n'
+                    f"<zoom>\n<maxPos>{ZOOM_MAX}</maxPos>\n<minPos>0</minPos>\n<curPos>{zoom}</curPos>\n</zoom>\n"
+                    f"<focus>\n<maxPos>{FOCUS_MAX}</maxPos>\n<minPos>0</minPos>\n<curPos>{focus}</curPos>\n</focus>\n"
+                    "</PtzZoomFocus>")))
+            else:   # MSG_ZOOM_FOCUS_SET
+                if xml_value(msg.payload, "command") != "zoomPos":
+                    raise ValueError(f"zoom/focus action not supported\n{msg.payload_text}")
+                await self.cam.ptz_zoom_to(self, int(xml_value(msg.payload, "movePos") or 0))
+                await self.send(msg.reply(200))
+        except Exception as e:  # noqa: BLE001 - camera refused, bad request: tell the app
+            log.warning("%s: PTZ msg %d failed: %s", self.tag, mid, e)
+            await self.send(msg.reply(400))
+
+    async def _save_patrols(self, msg: BcMsg) -> None:
+        for el in st._body(msg.payload).iter("cruise"):
+            # the app sends every point slot, the unused ones with presetId -1
+            points = [{"preset": int(k.findtext("presetId")), "dwell": int(k.findtext("dwellTime") or 15),
+                       "speed": to_dahua_speed(float(k.findtext("speed") or PTZ_DEFAULT_SPEED))}
+                      for k in el.iter("keyPos") if int(k.findtext("presetId") or 0) > 0]
+            patrol = int(el.findtext("patrolId") or 0)
+            await self.cam.hikcfg.ptz_tour_save(patrol + 1, el.findtext("name"), el.findtext("enable") != "0", points)
+            log.info("%s: patrol %d saved, %d points (write msg id %d)", self.tag, patrol, len(points), msg.msg_id)
+        await self.send(msg.reply(200))
 
     # ---------------------------------------------------------------- video
     async def on_preview(self, msg: BcMsg) -> None:
@@ -515,7 +646,7 @@ class BcSession:
                 await self.send(msg.reply(200))
             else:   # 298 timeline thumbnails
                 await self.send(msg.reply(400))
-        except Exception as e:  # noqa: BLE001 - Hikvision errors, bad requests
+        except Exception as e:  # noqa: BLE001 - camera errors, bad requests
             log.warning("%s: playback msg %d failed: %s", self.tag, mid, e)
             await self.send(msg.reply(400))
 
@@ -569,7 +700,7 @@ class BcSession:
                                 continue
                             clip_t0 = now
                         elapsed = now - clip_t0
-                        if elapsed > length + 1:    # Hikvision does not end the stream by itself
+                        if elapsed > length + 1:    # the camera may not end the stream by itself
                             break
                         micros = base_us + int(elapsed * 1_000_000)
                         wall = pb.wall_seconds(begin + dt.timedelta(seconds=elapsed))

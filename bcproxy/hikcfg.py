@@ -14,6 +14,7 @@ import logging
 import re
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass, field
+from xml.sax.saxutils import escape as xml_escape
 
 from .bc import XML_DECL
 from .hik import HikHttp, _strip_ns
@@ -167,13 +168,47 @@ ENC_TYPE_TO_MODE = {0: "vbr", 1: "cbr"}
 ENC_TYPE_FROM_MODE = {v: k for k, v in ENC_TYPE_TO_MODE.items()}
 
 
+def _hik_bitrate(doc: str) -> int:
+    vbr = re.search(r"<videoQualityControlType>\s*vbr", doc, re.I)
+    m = (re.search(r"<vbrUpperCap>(\d+)</vbrUpperCap>", doc) if vbr else None) or \
+        re.search(r"<constantBitRate>(\d+)</constantBitRate>", doc) or \
+        re.search(r"<vbrUpperCap>(\d+)</vbrUpperCap>", doc)
+    return int(m.group(1)) if m else 0
+
+
 class HikConfig:
+    unhandled_msgs: frozenset[int] = frozenset()    # settings messages this camera type does not take
+    ptz_type = 0                                    # PTZ is not connected for Hikvision
+    has_presets = False
+    has_tours = False
+
     def __init__(self, http: HikHttp, channel: int | None = 1) -> None:
         self.http, self.channel = http, channel or 1
         self.caps: dict[int, StreamCaps] = {}     # 1 = main, 2 = sub
         self.bitrate_mode: dict[int, str] = {}    # stream -> "cbr" / "vbr"
         self.light_on_mode: str | None = None     # supplementLightMode that means "light on"
         self.has_tamper = False
+
+    # ----------------------------------------------------------------- status
+    async def cpu_usage(self) -> int | None:
+        doc = (await self.http.get_bytes("/ISAPI/System/status")).decode("utf-8", "replace")
+        m = re.search(r"<cpuUtilization>(\d+)</cpuUtilization>", doc)
+        return int(m.group(1)) if m else None
+
+    async def bitrates(self) -> tuple[int, int]:
+        """Configured (main, sub) bitrate in kbps."""
+        docs = [(await self.http.get_bytes(self._stream_path(i))).decode("utf-8", "replace") for i in (1, 2)]
+        return _hik_bitrate(docs[0]), _hik_bitrate(docs[1])
+
+    async def set_channel_name(self, name: str) -> None:
+        path = f"/ISAPI/System/Video/inputs/channels/{self.channel}"
+        doc = (await self.http.get_bytes(path)).decode("utf-8")
+        new_doc, n = re.subn(r"<name>.*?</name>", f"<name>{xml_escape(name)}</name>", doc, count=1, flags=re.S)
+        if not n:
+            raise ValueError("no <name> in VideoInputChannel")
+        status, body = await self.http.put_bytes(path, new_doc.encode("utf-8"))
+        if status != 200:
+            raise ConnectionError(f"HTTP {status}: {body[:200]!r}")
 
     # ---------------------------------------------------------------- streams
     def _stream_path(self, idx: int) -> str:
@@ -470,6 +505,9 @@ class HikConfig:
 
     async def track(self) -> str:
         return (await self.http.get_bytes(self._track_path)).decode("utf-8")
+
+    async def record_xml(self, event_types: list[str]) -> str:
+        return record_xml(await self.track(), event_types)
 
     async def set_schedule(self, enable: bool, tables: dict[str, str]) -> None:
         doc = replace_schedule(await self.track(), schedule_actions(tables))

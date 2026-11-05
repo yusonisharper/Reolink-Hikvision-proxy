@@ -145,7 +145,13 @@ class HttpResponse:
         self.writer.close()
 
 
+class HttpStatusError(ConnectionError):
+    """The camera answered, with an error: unlike a network failure, retrying will not help."""
+
+
 class HikHttp:
+    connection = "keep-alive"
+
     def __init__(self, host: str, port: int, user: str, password: str, timeout: float = 10) -> None:
         self.host, self.port = host, port
         self.auth = DigestAuth(user, password)
@@ -155,8 +161,14 @@ class HikHttp:
                     ctype: str = "application/xml") -> HttpResponse:
         reader, writer = await asyncio.wait_for(
             asyncio.open_connection(self.host, self.port), self.timeout)
+        return await self.exchange(reader, writer, method, path, body, ctype)
+
+    async def exchange(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter, method: str, path: str,
+                       body: bytes | None = None, ctype: str = "application/xml",
+                       connection: str | None = None) -> HttpResponse:
+        """One request on an open connection, up to the end of the response headers."""
         hdrs = [f"{method} {path} HTTP/1.1", f"Host: {self.host}:{self.port}",
-                "User-Agent: reolink-hik-proxy", "Accept: */*", "Connection: keep-alive"]
+                "User-Agent: reolink-hik-proxy", "Accept: */*", f"Connection: {connection or self.connection}"]
         a = self.auth.header(method, path)
         if a:
             hdrs.append(f"Authorization: {a}")
@@ -207,7 +219,7 @@ class HikHttp:
         r = await self.request("GET", path)
         try:
             if r.status != 200:
-                raise ConnectionError(f"GET {path} -> HTTP {r.status}")
+                raise HttpStatusError(f"GET {path} -> HTTP {r.status}")
             return await asyncio.wait_for(r.read_all(), self.timeout)
         finally:
             r.close()

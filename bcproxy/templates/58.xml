@@ -4,7 +4,7 @@
 <streaming>1</streaming>
 <record>${disk_num}</record>
 <network>1</network>
-<PTZ>0</PTZ>
+<PTZ>${ptz_on}</PTZ>
 <IO>0</IO>
 <alarm>1</alarm>
 <image>1</image>

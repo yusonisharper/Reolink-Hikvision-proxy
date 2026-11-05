@@ -14,24 +14,31 @@ from .session import BcSession
 log = logging.getLogger("main")
 
 
+async def start_camera(cam: VirtualCamera, trace: bool, servers: list) -> None:
+    """Ask the source camera what it offers, then listen: a client that logs in earlier would be
+    told no PTZ, no playback. A camera that is offline only delays its own port."""
+    cc = cam.cfg
+    try:
+        await cam.start()
+
+        async def on_conn(r, w):
+            await BcSession(cam, r, w, trace=trace).run()
+
+        servers.append(await asyncio.start_server(on_conn, cc.listen_host, cc.listen_port))
+    except OSError as e:      # the other cameras keep running
+        log.error("%s: cannot listen on %s:%d: %s", cc.name, cc.listen_host, cc.listen_port, e)
+        return
+    log.info("%s: Reolink (Baichuan) endpoint on %s:%d -> %s %s",
+             cc.name, cc.listen_host, cc.listen_port, cam.vendor_label, cc.hik_host or "-")
+
+
 async def main_async(cfg_path: str, trace: bool | None) -> None:
     cfg = load(cfg_path)
     if trace is not None:
         cfg.trace = trace
-    cams: list[VirtualCamera] = []
-    servers = []
-    for cc in cfg.cameras:
-        cam = VirtualCamera(cc, cfg.templates_dir, cfg.unknown_reply, cfg.state_dir)
-        await cam.start()
-        cams.append(cam)
-
-        async def on_conn(r, w, cam=cam):
-            await BcSession(cam, r, w, trace=cfg.trace).run()
-
-        srv = await asyncio.start_server(on_conn, cc.listen_host, cc.listen_port)
-        servers.append(srv)
-        log.info("%s: Reolink (Baichuan) endpoint on %s:%d -> Hikvision %s",
-                 cc.name, cc.listen_host, cc.listen_port, cc.hik_host or "-")
+    cams = [VirtualCamera(cc, cfg.templates_dir, cfg.unknown_reply, cfg.state_dir) for cc in cfg.cameras]
+    servers: list = []
+    starting = [asyncio.create_task(start_camera(cam, cfg.trace, servers)) for cam in cams]
 
     if cfg.listen_port:
         by_ip = {c.cfg.hik_host: c for c in cams if c.cfg.event_source == "listen"}
@@ -61,6 +68,8 @@ async def main_async(cfg_path: str, trace: bool | None) -> None:
         except NotImplementedError:
             pass
     await stop.wait()
+    for t in starting:
+        t.cancel()
     for s in servers:
         s.close()
     for c in cams:
@@ -68,7 +77,7 @@ async def main_async(cfg_path: str, trace: bool | None) -> None:
 
 
 def main() -> None:
-    ap = argparse.ArgumentParser(description="Reolink Baichuan emulator for Hikvision cameras")
+    ap = argparse.ArgumentParser(description="Reolink Baichuan emulator for Hikvision and Dahua cameras")
     ap.add_argument("-c", "--config", default="config.yaml")
     ap.add_argument("-v", "--verbose", action="store_true", help="debug logging")
     ap.add_argument("--trace", action="store_true", default=None,

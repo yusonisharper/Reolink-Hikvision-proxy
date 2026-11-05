@@ -1,15 +1,18 @@
-"""A virtual Reolink camera backed by a Hikvision camera."""
+"""A virtual Reolink camera backed by a Hikvision or Dahua camera.
+
+The hik_* names below predate Dahua support and hold whichever camera is configured:
+hikcfg is a HikConfig or DahuaConfig, recordings a HikRecordings or DahuaRecordings.
+"""
 from __future__ import annotations
 
 import asyncio
 import logging
 import os
-import re
 import time
 from dataclasses import dataclass, field
 from xml.sax.saxutils import escape as xml_escape
 
-from . import discovery, hik
+from . import dahua, discovery, hik
 from . import settings as st
 from .bc import body_xml, xml_value
 from .events import AI_TYPES, SMART_TYPES, DetEvent, EventState, Holds, Snapshot
@@ -48,7 +51,8 @@ class CameraConfig:
     serial: str = ""
     uid: str = ""                      # P2P UID; empty (default) = IP-only, like a camera with P2P off
     mac: str = ""                      # MAC in LAN search replies (default: derived from name)
-    # Hikvision
+    # source camera
+    vendor: str = "hikvision"          # hikvision | dahua
     hik_host: str = ""
     hik_port: int = 80
     hik_user: str = "admin"
@@ -57,11 +61,12 @@ class CameraConfig:
     main_rtsp: str = ""
     sub_rtsp: str = ""
     snapshot_path: str = "/ISAPI/Streaming/channels/101/picture"
-    event_source: str = "alertstream"  # alertstream | listen | none
+    event_source: str = "alertstream"  # hikvision: alertstream | listen | none; dahua: attach | none
     playback: bool = True              # serve the Hikvision SD card recordings to the app/NVR
     playback_track: int = 101          # Hikvision record track (101 = main stream)
     audio: bool = True                 # forward the microphone (main stream audio, AAC transcoded)
     light_seconds: int = 30            # the manual light switches itself off after this long
+    ptz_max_seconds: int = 30          # a PTZ move without a stop ends after this long
     # events
     ai_types: list[str] = field(default_factory=lambda: ["people", "vehicle"])
     smart_zones: dict[str, list[dict]] = field(default_factory=dict)
@@ -81,19 +86,21 @@ RECORD_ABILITY = ("<record>\n<subModule>\n<channelId>0</channelId>\n"
                   "<abilityValue>download_rw, fileFind_rw, recordCfg_rw, recordSchedule_rw, subStreamRecord_ro"
                   "</abilityValue>\n"
                   "</subModule>\n</record>\n")
+# Dahua: playback only, the record settings are not connected to the camera
+RECORD_ABILITY_PLAYBACK = RECORD_ABILITY.replace("recordCfg_rw, recordSchedule_rw, ", "")
+PTZ_STOP_TRIES = 3
+ZOOM_SPEED = 1                # the speed argument hardly changes how fast a zoom goes
+ZOOM_RATE = 4500              # ZoomMapValue per second, measured on a real camera
+ZOOM_TRIES = 4
+ZOOM_CLOSE_ENOUGH = 300       # no move for a smaller difference
+ZOOM_STALLED = 50             # a pulse that moved less than this hit the end of the lens
+PTZ_ABILITY = "<PTZ>\n<subModule>\n<channelId>0</channelId>\n<abilityValue>control_rw, preset_rw{}</abilityValue>\n" \
+              "</subModule>\n</PTZ>\n"
 
 # Reolink-style option lists; the current value is always merged in.
 FPS_TABLE = [30, 25, 22, 20, 18, 16, 15, 12, 10, 8, 6, 4, 2]
 MAIN_KBPS = [1024, 1536, 2048, 3072, 4096, 5120, 6144, 7168, 8192]
 SUB_KBPS = [64, 128, 160, 192, 256, 384, 512, 768, 1024]
-
-
-def _hik_bitrate(doc: str) -> int:
-    vbr = re.search(r"<videoQualityControlType>\s*vbr", doc, re.I)
-    m = (re.search(r"<vbrUpperCap>(\d+)</vbrUpperCap>", doc) if vbr else None) or \
-        re.search(r"<constantBitRate>(\d+)</constantBitRate>", doc) or \
-        re.search(r"<vbrUpperCap>(\d+)</vbrUpperCap>", doc)
-    return int(m.group(1)) if m else 0
 
 
 def _table(values: list[int], cur: int, limit: int | None = None) -> str:
@@ -118,25 +125,35 @@ class VirtualCamera:
         self.settings = SettingsStore(state_dir, cfg.name)
         self.unknown_reply = unknown_reply
         self.state = EventState(holds=cfg.holds, ai_implies_motion=cfg.ai_implies_motion)
-        mapper_kw = {}
-        if cfg.event_map:
-            mapper_kw["event_map"] = {**hik.DEFAULT_EVENT_MAP, **{k.lower(): v for k, v in cfg.event_map.items()}}
-        if cfg.target_map:
-            mapper_kw["target_map"] = {**hik.DEFAULT_TARGET_MAP, **{k.lower(): v for k, v in cfg.target_map.items()}}
-        self.mapper = hik.EventMapper(untargeted_smart_target=cfg.untargeted_smart_target,
-                                      channel=cfg.hik_channel, region_base=cfg.region_base, **mapper_kw)
-        self.http = hik.HikHttp(cfg.hik_host, cfg.hik_port, cfg.hik_user, cfg.hik_password) if cfg.hik_host else None
-        self.hikcfg = HikConfig(self.http, cfg.hik_channel) if self.http else None
+        is_dahua = cfg.vendor == "dahua"
+        self.vendor_label = "Dahua" if is_dahua else "Hikvision"
+        event_map = dahua.DEFAULT_EVENT_MAP if is_dahua else hik.DEFAULT_EVENT_MAP
+        target_map = dahua.DEFAULT_TARGET_MAP if is_dahua else hik.DEFAULT_TARGET_MAP
+        self.mapper = hik.EventMapper(event_map={**event_map, **{k.lower(): v for k, v in cfg.event_map.items()}},
+                                      target_map={**target_map, **{k.lower(): v for k, v in cfg.target_map.items()}},
+                                      untargeted_smart_target=cfg.untargeted_smart_target,
+                                      channel=cfg.hik_channel, region_base=cfg.region_base)
+        http_type, config_type = (dahua.DahuaHttp, dahua.DahuaConfig) if is_dahua else (hik.HikHttp, HikConfig)
+        self.http = http_type(cfg.hik_host, cfg.hik_port, cfg.hik_user, cfg.hik_password) if cfg.hik_host else None
+        self.hikcfg = config_type(self.http, cfg.hik_channel) if self.http else None
         self.audio = AudioSource(f"{cfg.name}/audio", cfg.main_rtsp) if cfg.audio and cfg.main_rtsp else None
         self.audio_on = False               # Hikvision main stream carries audio
         self.light_status = False
         self._light_restore = "close"
         self._light_task: asyncio.Task | None = None
+        self._ptz_lock = asyncio.Lock()
+        self._ptz_code: str | None = None   # what the camera is doing until a stop
+        self._ptz_owner: object | None = None
+        self._ptz_watchdog: asyncio.Task | None = None
+        self._zoom_task: asyncio.Task | None = None
+        self.ptz_tour: int | None = None    # the patrol started from here, for a stop that names none
         self.main =StreamSource(f"{cfg.name}/main", cfg.main_rtsp, cfg.main_info) if cfg.main_rtsp else None
         self.sub = StreamSource(f"{cfg.name}/sub", cfg.sub_rtsp or cfg.main_rtsp, cfg.sub_info) \
             if (cfg.sub_rtsp or cfg.main_rtsp) else None
-        self.recordings = HikRecordings(self.http, cfg.playback_track) \
-            if self.http and cfg.playback and cfg.main_rtsp else None
+        self.recordings = None
+        if self.http and cfg.playback and cfg.main_rtsp:
+            self.recordings = dahua.DahuaRecordings(self.http, cfg.hik_channel) if is_dahua \
+                else HikRecordings(self.http, cfg.playback_track)
         # detections with time, to label playback files people/vehicle/...
         self.journal = EventJournal(self.settings.dir / "events.jsonl" if self.settings.dir else None)
         self.alarm_subs: set = set()        # BcSession objects
@@ -159,17 +176,18 @@ class VirtualCamera:
                 except Exception as e:  # noqa: BLE001 - keep running, NVR may still connect
                     log.warning("%s: probe of %s failed: %s", self.cfg.name, src.name, e or type(e).__name__)
         if self.hikcfg and not await self._load_hik():
-            # Hikvision rebooting or unreachable: don't lose playback, light and sizes until our restart
-            log.warning("%s: Hikvision not reachable, will keep trying", self.cfg.name)
+            # camera rebooting or unreachable: don't lose playback, light and sizes until our restart
+            log.warning("%s: %s not reachable, will keep trying", self.cfg.name, self.vendor_label)
             self._tasks.append(asyncio.create_task(self._retry_load_hik()))
-        if self.cfg.event_source == "alertstream" and self.http:
-            self._tasks.append(asyncio.create_task(hik.alert_stream(self.http, self.on_alert)))
+        events = {"alertstream": hik.alert_stream, "attach": dahua.event_stream}.get(self.cfg.event_source)
+        if events and self.http:
+            self._tasks.append(asyncio.create_task(events(self.http, self.on_alert)))
         self._tasks.append(asyncio.create_task(self._ticker()))
         if self.http:
             self._tasks.append(asyncio.create_task(self._poll_status()))
 
     async def _load_hik(self) -> bool:
-        """What this Hikvision camera offers. False when it could not be asked."""
+        """What the source camera offers. False when it could not be asked."""
         try:
             if self.recordings:
                 disk = await self.recordings.storage()
@@ -177,17 +195,17 @@ class VirtualCamera:
                     log.info("%s: playback off (no SD card / HDD)", self.cfg.name)
                     self.recordings = None
                 else:
-                    log.info("%s: playback from Hikvision storage (%d of %d MB free)", self.cfg.name,
-                             disk[1], disk[0])
+                    log.info("%s: playback from %s storage (%d of %d MB free)", self.cfg.name,
+                             self.vendor_label, disk[1], disk[0])
             await self.hikcfg.load()
             self.audio_on = bool(self.audio) and await self.hikcfg.audio_enabled()
             if self.hikcfg.light_on_mode:
                 self.light_status = await self.hikcfg.light_mode() == self.hikcfg.light_on_mode
         except (OSError, asyncio.TimeoutError) as e:
-            log.debug("%s: Hikvision capabilities: %s", self.cfg.name, e)
+            log.debug("%s: %s capabilities: %s", self.cfg.name, self.vendor_label, e)
             return False
         except Exception as e:  # noqa: BLE001 - keep running without these features
-            log.warning("%s: Hikvision capabilities: %s", self.cfg.name, e)
+            log.warning("%s: %s capabilities: %s", self.cfg.name, self.vendor_label, e)
         log.info("%s: streams %s, audio %s, light %s", self.cfg.name,
                  {k: v.sizes for k, v in self.hikcfg.caps.items()}, "on" if self.audio_on else "off",
                  self.hikcfg.light_on_mode or "none")
@@ -200,6 +218,7 @@ class VirtualCamera:
     async def stop(self) -> None:
         for t in self._tasks:
             t.cancel()
+        await self._ptz_stop_logged()
         if self._light_task:      # don't leave a timed light burning without its timer
             try:
                 await self.set_light(False)
@@ -233,6 +252,111 @@ class VirtualCamera:
             await self.set_light(False)
         except Exception as e:  # noqa: BLE001
             log.warning("%s: could not switch the light off: %s", self.cfg.name, e)
+
+    # -------------------------------------------------------------------- PTZ
+    async def ptz_start(self, session: object, code: str, speed: int) -> None:
+        """Moves until ptz_stop. The app is expected to send stop on release; if it does not,
+        or its connection goes, the watchdog and ptz_release stop the camera anyway."""
+        if self._zoom_task and self._zoom_task is not asyncio.current_task():
+            self._zoom_task.cancel()  # this move replaces a zoom to a position
+            self._zoom_task = None
+        async with self._ptz_lock:
+            if self._ptz_code and self._ptz_code != code:
+                await self._ptz_halt()
+            self._ptz_code, self._ptz_owner = code, session
+            try:
+                await self.hikcfg.ptz_start(code, speed)
+            except Exception:
+                self._ptz_code = self._ptz_owner = None
+                raise
+            if self._ptz_watchdog:
+                self._ptz_watchdog.cancel()
+            self._ptz_watchdog = asyncio.create_task(self._ptz_timeout())
+
+    async def ptz_stop(self) -> None:
+        async with self._ptz_lock:
+            await self._ptz_halt()
+
+    async def ptz_tour_start(self, tour: int) -> None:
+        """A tour runs on the camera by itself: no watchdog, and it outlives the app's connection."""
+        async with self._ptz_lock:
+            await self._ptz_halt()
+            await self.hikcfg.ptz_tour_start(tour)
+            self.ptz_tour = tour
+
+    async def ptz_tour_stop(self, tour: int | None) -> None:
+        async with self._ptz_lock:
+            await self.hikcfg.ptz_tour_stop(tour or self.ptz_tour or 1)
+            self.ptz_tour = None
+
+    async def ptz_goto(self, preset: int) -> None:
+        async with self._ptz_lock:
+            await self._ptz_halt()
+            await self.hikcfg.ptz_goto(preset)
+
+    async def ptz_zoom_to(self, session: object, target: int) -> None:
+        """Start zooming to a position and return; the app can send other commands meanwhile,
+        and any stop or other move takes over."""
+        if self._zoom_task:
+            self._zoom_task.cancel()
+        await self.ptz_stop()
+        self._zoom_task = asyncio.create_task(self._zoom_follow(session, max(0, min(dahua.ZOOM_MAX, target))))
+
+    async def _zoom_follow(self, session: object, target: int) -> None:
+        """Timed pulses, each corrected from where the last one ended. Stopping when the position
+        is seen to arrive overshoots by far: a status request can take a second, at ZOOM_RATE."""
+        try:
+            for _ in range(ZOOM_TRIES):
+                cur = (await self.hikcfg.zoom_focus())[0]
+                if abs(target - cur) <= ZOOM_CLOSE_ENOUGH:
+                    return
+                code = "ZoomTele" if target > cur else "ZoomWide"
+                await self.ptz_start(session, code, ZOOM_SPEED)
+                await asyncio.sleep(abs(target - cur) / ZOOM_RATE)
+                if self._ptz_code != code:
+                    return                  # a stop or another move came in
+                await self.ptz_stop()
+                if abs((await self.hikcfg.zoom_focus())[0] - cur) < ZOOM_STALLED:
+                    return                  # did not move: the end of the lens
+        except (OSError, asyncio.TimeoutError) as e:
+            log.warning("%s: zoom to %d failed: %s", self.cfg.name, target, e)
+            await self._ptz_stop_logged()
+
+    async def _ptz_halt(self) -> None:
+        """A camera left moving is worse than a slow answer, so a failed stop is tried again."""
+        code = self._ptz_code
+        if code is None:
+            return
+        watchdog, self._ptz_watchdog = self._ptz_watchdog, None
+        if watchdog and watchdog is not asyncio.current_task():
+            watchdog.cancel()
+        for attempt in range(PTZ_STOP_TRIES):
+            try:
+                await self.hikcfg.ptz_stop(code)
+                self._ptz_code = self._ptz_owner = None
+                return
+            except (OSError, asyncio.TimeoutError) as e:
+                log.warning("%s: PTZ stop failed (try %d): %s", self.cfg.name, attempt + 1, e)
+                if attempt + 1 == PTZ_STOP_TRIES:
+                    raise
+                await asyncio.sleep(1)
+
+    async def _ptz_timeout(self) -> None:
+        await asyncio.sleep(self.cfg.ptz_max_seconds)
+        log.warning("%s: PTZ still moving after %d s without a stop: stopping", self.cfg.name, self.cfg.ptz_max_seconds)
+        await self._ptz_stop_logged()
+
+    async def _ptz_stop_logged(self) -> None:
+        try:
+            await self.ptz_stop()
+        except Exception as e:  # noqa: BLE001
+            log.error("%s: could not stop PTZ: %s", self.cfg.name, e)
+
+    def ptz_release(self, session: object) -> None:
+        """A connection ended: nobody is left to send its stop."""
+        if self._ptz_owner is session and self._ptz_code:
+            log.info("%s: stopping PTZ, its client disconnected", self.cfg.name)
+            self._tasks.append(asyncio.create_task(self._ptz_stop_logged()))
 
     # ---------------------------------------------------------------- streams
     def stream_info_list(self) -> str:
@@ -268,7 +392,7 @@ class VirtualCamera:
             self.settings.put(FRAME_RATE_MODE_KEY, body_xml(f"<constantFrameRate>{value}</constantFrameRate>"))
 
     async def apply_compression(self, payload: bytes) -> None:
-        """57: resolution / frame rate / bitrate / codec go to the Hikvision camera."""
+        """57: resolution / frame rate / bitrate / codec go to the source camera."""
         root = st._body(payload)
         for idx, tag, src, attr in ((1, "mainStream", self.main, "hik_bitrate"),
                                     (2, "subStream", self.sub, "hik_sub_bitrate")):
@@ -292,8 +416,8 @@ class VirtualCamera:
                 continue
             await self.hikcfg.set_stream(idx, w, h, fps, kbps, audio)
             codec, w, h, fps, kbps = await self.hikcfg.stream_state(idx)
-            log.info("%s: Hikvision %s now %dx%d %d fps %d kbps %s %s", self.cfg.name, tag, w, h, fps, kbps, codec,
-                     self.hikcfg.bitrate_mode.get(idx, "vbr"))
+            log.info("%s: %s %s now %dx%d %d fps %d kbps %s %s", self.cfg.name, self.vendor_label, tag, w, h, fps,
+                     kbps, codec, self.hikcfg.bitrate_mode.get(idx, "vbr"))
             setattr(self, attr, kbps)
             if audio is not None:
                 self.audio_on = audio
@@ -320,23 +444,18 @@ class VirtualCamera:
             self._maybe_push()
 
     async def _poll_status(self, interval: float = 10) -> None:
-        """CPU usage + configured bitrate from the Hikvision camera (for NVR "Performance")."""
+        """CPU usage + configured bitrate from the source camera (for NVR "Performance")."""
         warned = False
         while True:
             try:
-                st = (await self.http.get_bytes("/ISAPI/System/status")).decode("utf-8", "replace")
-                m = re.search(r"<cpuUtilization>(\d+)</cpuUtilization>", st)
-                self.hik_cpu = int(m.group(1)) if m else None
+                self.hik_cpu = await self.hikcfg.cpu_usage()
                 if self.hik_bitrate is None:
-                    for idx, attr in ((1, "hik_bitrate"), (2, "hik_sub_bitrate")):
-                        sc = (await self.http.get_bytes(
-                            f"/ISAPI/Streaming/channels/{self.cfg.hik_channel}0{idx}")).decode("utf-8", "replace")
-                        setattr(self, attr, _hik_bitrate(sc))
-                    log.info("%s: Hikvision bitrate main=%s sub=%s kbps", self.cfg.name,
+                    self.hik_bitrate, self.hik_sub_bitrate = await self.hikcfg.bitrates()
+                    log.info("%s: %s bitrate main=%s sub=%s kbps", self.cfg.name, self.vendor_label,
                              self.hik_bitrate, self.hik_sub_bitrate)
             except Exception as e:  # noqa: BLE001
                 if not warned:
-                    log.warning("%s: Hikvision status poll failed: %s", self.cfg.name, e)
+                    log.warning("%s: %s status poll failed: %s", self.cfg.name, self.vendor_label, e)
                     warned = True
             await asyncio.sleep(interval)
 
@@ -403,24 +522,17 @@ class VirtualCamera:
         return True
 
     async def _sync_name(self, name: str) -> None:
-        path = f"/ISAPI/System/Video/inputs/channels/{self.cfg.hik_channel}"
         try:
-            doc = (await self.http.get_bytes(path)).decode("utf-8")
-            new_doc, n = re.subn(r"<name>.*?</name>", f"<name>{xml_escape(name)}</name>", doc, count=1,
-                                 flags=re.S)
-            if not n:
-                raise ValueError("no <name> in VideoInputChannel")
-            status, body = await self.http.put_bytes(path, new_doc.encode("utf-8"))
-            if status != 200:
-                raise ConnectionError(f"HTTP {status}: {body[:200]!r}")
-            log.info("%s: Hikvision channel name set to %r", self.cfg.name, name)
+            await self.hikcfg.set_channel_name(name)
+            log.info("%s: %s channel name set to %r", self.cfg.name, self.vendor_label, name)
         except Exception as e:  # noqa: BLE001
-            log.warning("%s: could not rename Hikvision channel: %s", self.cfg.name, e)
+            log.warning("%s: could not rename %s channel: %s", self.cfg.name, self.vendor_label, e)
 
     def template_vars(self, username: str = "") -> dict:
         t = time.localtime()
         mi = (self.main.info if self.main and self.main.info else None) or StreamInfo()
         si = (self.sub.info if self.sub and self.sub.info else None) or StreamInfo(width=640, height=360, fps=15)
+        ptz_type = self.hikcfg.ptz_type if self.hikcfg else 0
         return {
             "name": xml_escape(self.display_name), "model": self.cfg.model, "hardware": self.cfg.hardware,
             "firmware": self.cfg.firmware, "build_day": self.cfg.build_day, "detail": self.cfg.detail,
@@ -436,7 +548,14 @@ class VirtualCamera:
             "light_seconds": self.cfg.light_seconds,
             "disk_num": 1 if self.recordings else 0, "record_ver": 3 if self.recordings else 0,
             "replay_version": 21 if self.recordings else 0,
-            "record_ability": RECORD_ABILITY if self.recordings else "",
+            "record_ability": "" if not self.recordings
+            else RECORD_ABILITY_PLAYBACK if self.cfg.vendor == "dahua" else RECORD_ABILITY,
+            # reolink_aio confirms ptzType and ptzPreset; ptzMode, ptzControl and the PTZ ability are inferred
+            "ptz_type": ptz_type, "ptz_mode": "pt" if ptz_type == 2 else "none", "ptz_on": 1 if ptz_type else 0,
+            "ptz_preset": 1 if self.hikcfg and self.hikcfg.has_presets else 0,
+            "ptz_patrol": 1 if self.hikcfg and self.hikcfg.has_tours else 0,
+            "ptz_ability": "" if not ptz_type
+            else PTZ_ABILITY.format(", cruise_rw" if self.hikcfg.has_tours else ""),
             "bc_port": self.cfg.listen_port, "ip": self.ip, "mask": "255.255.255.0",
             "gateway": self.ip.rsplit(".", 1)[0] + ".1", "mac": self.mac.lower(),
             "main_w": mi.width, "main_h": mi.height, "main_fps": mi.fps,

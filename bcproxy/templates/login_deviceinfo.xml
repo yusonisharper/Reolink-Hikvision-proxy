@@ -17,7 +17,7 @@
 <bootSecret>0000000000000000</bootSecret>
 <language>English</language>
 <sdCard>${disk_num}</sdCard>
-<ptzMode>none</ptzMode>
+<ptzMode>${ptz_mode}</ptzMode>
 <typeInfo>IPC</typeInfo>
 <softVer>50332078</softVer>
 <hardVer>0</hardVer>

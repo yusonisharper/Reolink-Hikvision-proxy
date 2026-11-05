@@ -192,9 +192,9 @@ def test_event_journal_labels_and_persists(tmp_path):
     j.add({"people", "crossline"}, t + dt.timedelta(minutes=10))
     assert len(j.items) == 3
     seg = lambda a, b: pb.Segment(t + dt.timedelta(seconds=a), t + dt.timedelta(seconds=b), "md")  # noqa: E731
-    assert j.label(seg(-20, -3)) == "vehicle"                 # within slack
+    assert j.label(seg(-20, -3)) == "vehicle,md"              # within slack
     assert j.label(seg(60, 120)) == "md"
-    assert j.label(seg(590, 620)) == "people,crossline"       # most specific first, both kept
+    assert j.label(seg(590, 620)) == "people,crossline,md"    # most specific first, all kept
     j2 = pb.EventJournal(p)                                   # reloaded from disk
     assert j2.items == j.items
     old = pb.EventJournal(p, keep_days=0)                     # pruned on load

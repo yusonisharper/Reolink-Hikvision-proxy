@@ -1,5 +1,5 @@
 # reolink-hik-proxy 配置示例
-# 每个 camera 条目 = 一台"虚拟 Reolink 摄像头"，背后是一台海康摄像头。
+# 每个 camera 条目 = 一台"虚拟 Reolink 摄像头"，背后是一台海康（hik:）或大华（dahua:）摄像头。
 # NVR 用 Reolink 协议（Baichuan, TCP 9000）连接 listen 地址。
 
 log_level: info          # debug 可看到每条海康告警的映射结果
@@ -88,3 +88,41 @@ cameras:
       # 覆盖默认映射（键不区分大小写）
       # event_map: {regionExiting: intrusion, PIR: motion}
       # target_map: {nonMotorVehicle: people}
+
+  # 大华摄像头：把 hik: 换成 dahua:，其余（listen、events 等）含义相同。
+  - name: front-door
+    listen: 192.168.1.202:9000
+    username: admin
+    password: "change-me"
+    model: RLC-811A            # 球机建议用带云台的型号，如 RLC-823A
+
+    dahua:
+      host: 192.168.1.108
+      port: 80
+      username: admin
+      password: "dahua-password"
+      sync_name: true          # 改名时同步修改大华通道标题（ChannelTitle）
+      channel: 1               # 从 1 开始，与 RTSP 的 channel 相同；NVR 型大华改成对应通道
+      main_rtsp: rtsp://admin:dahua-password@192.168.1.108:554/cam/realmonitor?channel=1&subtype=0
+      sub_rtsp:  rtsp://admin:dahua-password@192.168.1.108:554/cam/realmonitor?channel=1&subtype=1
+      # snapshot_path: /cgi-bin/snapshot.cgi?channel=1   # 默认按 channel 生成
+      playback: true           # App/NVR 回放大华 SD 卡录像（无存储时自动关闭）
+      audio: true
+      events: attach           # attach(eventManager 事件流) | none；大华不支持 listen
+      # ptz_max_seconds: 30    # 云台能力自动识别；一次移动没收到 stop 时，最多转这么久
+
+    events:
+      ai_types: [people, vehicle]
+      # zone 对应大华事件里的 RuleId - region_base。第一次接真机时对照 -v 日志里的 RuleId，
+      # 如果从 0 开始，把 region_base 改成 0。
+      smart:
+        crossline:             # 大华 CrossLineDetection（警戒线）
+          - {zone: 0, name: Gate, targets: [people, vehicle]}
+        intrusion:             # 大华 CrossRegionDetection（警戒区）
+          - {zone: 0, name: Yard, targets: [people]}
+        loitering: []          # 大华 WanderDetection（徘徊）
+      hold: {motion: 3, ai: 5, smart: 5}
+      region_base: 1
+      # 大华的其他事件可以在这里加（键不区分大小写），目标用事件里的 ObjectType：
+      # event_map: {FaceDetection: motion}
+      # target_map: {Nonmotor: people}

@@ -1,6 +1,8 @@
 # reolink-hik-proxy
 
-把海康威视摄像头伪装成 Reolink 摄像头，让 Reolink NVR 用原生 Reolink 协议（Baichuan, TCP 9000）接入。重点是**事件映射**：海康的人形/车辆识别、越界、区域入侵、徘徊会被翻译成 Reolink 的 AI 和智能侦测事件，而不是 ONVIF 只能传的 motion。
+把海康威视和大华摄像头伪装成 Reolink 摄像头，让 Reolink NVR 用原生 Reolink 协议（Baichuan, TCP 9000）接入。重点是**事件映射**：人形/车辆识别、越界、区域入侵、徘徊会被翻译成 Reolink 的 AI 和智能侦测事件，而不是 ONVIF 只能传的 motion。
+
+下文未特别说明时讲的都是海康；大华见[大华摄像头](#大华摄像头)。
 
 ```
 海康 IPC ──ISAPI alertStream / HTTP 推送──┐
@@ -22,6 +24,66 @@
 - 海康 `regionID`（从 1 开始）映射为 Reolink 区域编号 `zone`（从 0 开始）。
 - 越界这类单次脉冲告警会保持 `hold.smart` 秒，让 NVR 有时间触发录像；VMD 收到 `inactive` 时立即清除。
 - NVR 是否认为摄像头支持这些功能，取决于 msg 199 `<Support>` 中的 `<aitype>`（bit1=人, bit2=车, bit4=猫狗）和 `<smartAI>`（bit1=越界, bit2=入侵, bit3=徘徊）。这两个值根据配置里的 `ai_types` 和 `smart` 自动生成；msg 527/529/531 的区域列表也由配置生成。
+
+## 大华摄像头
+
+配置里把 `hik:` 换成 `dahua:` 即可，示例见 `config.example.yaml`。
+
+```
+大华 IPC ──eventManager.cgi 事件流─────────────┐
+        ──RTSP 主/子码流 (ffmpeg -c copy)──────┼─▶ bcproxy ──Baichuan :9000──▶ Reolink NVR
+        ──snapshot / configManager / mediaFileFind┘
+```
+
+| 大华事件 Code | 目标 | Reolink msg 33 输出 |
+|---|---|---|
+| `VideoMotion` | 无 | `MD` |
+| `SmartMotionHuman` / `SmartMotionVehicle` | 由 Code 决定 | `MD` + `people` / `vehicle` |
+| `CrossLineDetection` | `Object.ObjectType` | `crossline` |
+| `CrossRegionDetection` | `Object.ObjectType` | `intrusion` |
+| `WanderDetection` | `Object.ObjectType` | `loitering` |
+| `VideoBlind` | – | `tamper` |
+
+大华的 `Start` / `Stop` 只各发一次，代理在两者之间每秒重复一次事件，效果和海康的持续告警相同；超过 10 分钟没等到 `Stop` 则认为丢失。除普通移动外，`Stop` 不会立刻清除状态，而是等 `hold` 保持时间结束。
+
+**状态：** 在一台真机（Amcrest `IP4M-1083E-AI`，即大华 SD5A432XB-HNR，固件 2.810，2560×1440 H.265）上用 `tools/bc_client.py` 验证过读取、预览和 PTZ；还没有接过 Reolink NVR / App，写入设置和人/车、智能事件也没有在真机上触发过。其余部分只用 `tools/fake_dahua.py` 测试过，不同型号和固件可能有差异。第一次接新型号时用 `-v` 运行，重点看事件的 `RuleId` 是否对应 `region_base`，以及 `encode.cgi getConfigCaps` 能否解析出分辨率（解析不出时只提供当前分辨率）。
+
+| 功能 | 大华 |
+|---|---|
+| 主/子码流预览、抓图 | ✅ 真机验证（`bc_client`，未接 NVR / App） |
+| 声音、AI / 智能事件 | 🟡 已接，待真机验证（事件流已连通，只收到过 `NewFile`） |
+| SD 卡回放 | 🟡 录像查询和容量已在真机读到；RTSP `/cam/playback` 回放待验证 |
+| 码流（分辨率、帧率、码率、CBR/VBR、声音开关） | 🟡 能力和当前值已在真机读到；写入 `Encode` 待验证 |
+| 图像页 | 🟡 只接亮度、对比度、饱和度、锐度、镜像、翻转、日夜模式；其余不生效 |
+| Tamper Alert 开关、改名 | 🟡 写到 `BlindDetect`、`ChannelTitle`，待真机验证 |
+| PTZ：方向、变焦、转到预置点 | ✅ App 已测（变焦滑块未单独确认） |
+| PTZ：保存/删除预置点、巡航 | 🟡 大华侧已在真机验证，App 待验证（见下） |
+| PTZ：手动对焦 | ❌ 未接 |
+| 录像计划和录像设置（54/55/81/82） | ❌ 未接，不向 App 声明；请在大华网页上设置 |
+| 服务端口（37/38）、手动灯、CPU 占用、HTTP 推送事件 | ❌ 未接 |
+
+注意：大华连续登录失败可能锁定账号，密码填错时代理的重连可能触发锁定。
+
+### PTZ
+
+| Baichuan 消息 | 大华 |
+|---|---|
+| 18 `PtzControl`（left/right/up/down/斜向/stop、速度 1–64） | `ptz.cgi` start/stop，速度换算为 1–8 |
+| 18 变焦（zoomIn/zoomInc、zoomOut/zoomDec） | `ZoomTele` / `ZoomWide` |
+| 190 / 19 `toPos`、`setPos`、`delPos` | `getPresets` / `GotoPreset`、`SetPreset` + `PtzPreset[].Name`、`ClearPreset`（只显示和操作 1–128 号） |
+| 18 `startPatrol` / `stopPatrol` + `patrolId` | `StartTour` / `StopTour` |
+| `<PtzCruise>`（写入按标签识别，读取的消息号见下） | `PtzTour` 配置表 |
+| 294 / 295 `zoomPos` | `ZoomMapValue`（0–16384）/ 见下 |
+
+- **依据：** `ptzType=2`、`ptzPreset` 来自 reolink_aio；命令名和 `PtzCruise`、`PtzPreset` 的字段来自 Reolink Client 的 `libBCSDKWrapper.dll`。`ptzMode=pt`、`ptzControl`、`ptzCfg` 没有真机抓包。App 发来不认识的命令时，日志会打印 `PTZ msg ... failed` 和完整 XML，按它补 `dahua.PTZ_CODES`。
+- **安全：** 移动时客户端断开会立即停止；超过 `ptz_max_seconds`（默认 30 秒）没收到 stop 也会停止；停止失败重试 3 次。代理被强杀时无法发送停止命令。
+- **预置点：** App 只看到 1–128 号，保存和删除也只接受这个范围，之后的预置点留在摄像头上不动。保存到已有编号会覆盖它。
+- **巡航：** 对应大华 Tour，只列出有预置点的路线，数量上限取 `caps.TourMax`。这台机的驻留时间最少 15 秒，写入更小的值会被抬到 15。
+- **巡航的两套编号（真机确认）：** App 的 `patrolId` 从 0 开始，大华 Tour 从 1 开始。`PtzTour` 表里的预置点是从 0 开始的序号（预置点 7 存成 6，`-1` 表示空），写错了不会报错，摄像头只会去错位置。
+- **巡航读取：** App 打开 PTZ 面板时会依次发 294、190、64。64 返回空内容时，面板提示 “failed to load”，所以按巡航读取回复 `<PtzCruise>`（`session.MSG_CRUISE_READS`）。
+- **绝对变焦：** 这台机的 `PositionABS` 不能设置变焦，每次调用都只放大一档，与 `arg3` 无关，所以 295 用定时脉冲加读回修正（`ZOOM_RATE`）。实测广角到中段误差约 70，长焦端约 600（满量程 16384）。速度参数对变焦几乎没有影响。
+- `getStatus` 的 `MoveStatus` 在转到预置点时会过早显示 Idle，判断到位要看位置是否稳定。
+- 摄像头自己的归位任务（PtzAutoMovement）不受代理控制，可能在 App 操作后把画面转回去。
 
 ## 快速开始
 
@@ -46,6 +108,8 @@ python -m bcproxy -c config.yaml -v
 python tools/bc_client.py 127.0.0.1 -p change-me --get 199 527 --alarms --seconds 60
 python tools/bc_client.py 127.0.0.1 -p change-me --preview subStream --out sub.h264 --snap a.jpg
 ```
+
+大华用 `python tools/fake_dahua.py --port 8081`（账号 `admin` / `dahua12345`），可输入 `motion`、`human`、`human off`、`line 1 Human`、`region 2 Vehicle`、`blind`。
 
 ## 兼容性状态
 
@@ -86,6 +150,9 @@ python tools/bc_client.py 127.0.0.1 -p change-me --preview subStream --out sub.h
 还缺实时目标坐标：海康 RTSP 只有视频和音频。海康 App 的回放能显示框，所以数据应该和录像存在一起，下一步从这里查。App 的开关可能由 199 的 `thumbnail`、`ptzControl` 或 `newIspCfg` 第 6、7 位控制，未验证。
 
 ### 协议上踩过的坑
+
+- **同一连接的并发：** 读循环不等请求处理完，否则慢请求期间连 socket 都不读，PTZ 的 `stop` 进不了处理。登录除外：下一条消息的解密依赖它。
+- **回放筛选类型：** 14 的 `<recordType>` 要列出 `crossline,intrusion,loitering`；片段的 `recordType` 保留 `md`，只有 `sched` 在有其他类型时才去掉。
 
 - **回放切换文件**：真机只发一次 `replayStreamInfo`，下一个文件开始时帧头最后一个字段（文件编号）变化，`micros` 换新基准，I 帧带该文件的真实时间，没有其他消息（Duo 2 抓包）。代理目前不做自动切换，这里只作记录。若要做，海康的一条 RTSP 流能无缝跨过录像空档，需加 `-use_wallclock_as_timestamps 1` 避免时间戳报错。
 - **回放片段结束**：海康的 RTSP 回放到 `endtime` 后既不发帧也不断开，要靠超时判断结束。
@@ -130,6 +197,7 @@ bcproxy/
   camera.py     虚拟摄像头：海康事件 → 状态机 → 推送；能力位、改名、海康状态轮询
   discovery.py  局域网搜索应答（UDP 2000 → 3000）
   hikcfg.py     写到海康的设置：码流、录像计划、灯光
+  dahua.py      大华：事件流、配置表、SD 卡录像（接口和 hik/hikcfg/HikRecordings 对应）
   playback.py   回放：录像搜索、事件标签、回放流
   settings.py   NVR/App 写入设置的合并与持久化
   events.py     事件状态机 + <AlarmEventList> 生成
@@ -142,12 +210,13 @@ tools/
   bc_discover.py 局域网搜索（列出真机和虚拟摄像头）
   bc_relay.py   App/NVR 与真机之间的录制中继（输出 pcap，交给 bc_dump.py 解密）
   fake_hik.py   假海康 ISAPI 服务
+  fake_dahua.py 假大华 CGI 服务（含 PTZ）
 tests/          协议测试（使用 neolink 的真机样本）+ 端到端测试：python -m pytest
 ```
 
 ## 其他限制
 
-- 未实现：对讲、PTZ、Motion Boxes、UDP/P2P 连接。回放只回放视频（无音频），播放速度固定 1 倍。
+- 未实现：对讲、海康 PTZ、Motion Boxes、UDP/P2P 连接。回放只回放视频（无音频），播放速度固定 1 倍。
 - 图像页（25/26/132）读写海康：亮度、对比度、饱和度、锐度、镜像翻转、电源频率、日夜模式、白平衡、3D 降噪。曝光、增益、背光、色调没有对接，保存后不生效。
 - 服务器设置（37/38）读写海康：HTTPS、ONVIF 可改；禁用海康 HTTP/RTSP 或改它们的端口会被拒绝，因为代理依赖它们。
 - 只保存在代理、不会写到海康的设置：移动侦测（47）、OSD、网络类页面（DHCP、DDNS、UPnP）。

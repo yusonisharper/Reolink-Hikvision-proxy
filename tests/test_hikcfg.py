@@ -161,7 +161,8 @@ def test_journal_types_survive_merging():
     t = dt.datetime(2026, 11, 3)
     segs = [pb.Segment(t + dt.timedelta(seconds=30 * i), t + dt.timedelta(seconds=30 * i + 10),
                        "people" if i % 2 else "vehicle,intrusion") for i in range(40)]
-    assert pb.join_types("md", "vehicle", "intrusion") == "vehicle,intrusion"
+    assert pb.join_types("md", "vehicle", "intrusion") == "vehicle,intrusion,md"
+    assert pb.join_types("sched", "vehicle") == "vehicle"
     assert pb.join_types("md") == "md"
     kept = pb.merge_segments(segs, t, t + dt.timedelta(days=1), max_items=100)
     assert {s.rec_type for s in kept} == {"people", "vehicle,intrusion"} and len(kept) == 40   # no need to merge

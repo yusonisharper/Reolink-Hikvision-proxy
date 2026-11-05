@@ -43,7 +43,17 @@ def load(path: str) -> AppConfig:
         raw = yaml.safe_load(f) or {}
     cams = []
     for c in raw.get("cameras", []):
-        hik = c.get("hik", {})
+        if "hik" in c and "dahua" in c:
+            raise ValueError(f"{c['name']}: use either hik or dahua, not both")
+        vendor = "dahua" if "dahua" in c else "hikvision"
+        hik = c.get("dahua" if vendor == "dahua" else "hik", {})
+        channel = hik.get("channel", 1)
+        if vendor == "dahua":
+            default_snapshot, default_events = f"/cgi-bin/snapshot.cgi?channel={channel}", "attach"
+            if hik.get("events", default_events) not in ("attach", "none"):
+                raise ValueError(f"{c['name']}: dahua events must be attach or none")
+        else:
+            default_snapshot, default_events = "/ISAPI/Streaming/channels/101/picture", "alertstream"
         ev = c.get("events", {})
         host, port = _hostport(str(c.get("listen", "0.0.0.0:9000")), 9000)
         ai_types = ev.get("ai_types", ["people", "vehicle"])
@@ -66,14 +76,15 @@ def load(path: str) -> AppConfig:
             perf_probe=bool((c.get("performance") or {}).get("probe", False)),
             **{k: str(c[k]) for k in ("model", "hardware", "firmware", "build_day", "detail", "serial", "uid", "mac")
                if k in c},
-            hik_host=hik.get("host", ""), hik_port=int(hik.get("port", 80)),
+            vendor=vendor, hik_host=hik.get("host", ""), hik_port=int(hik.get("port", 80)),
             hik_user=hik.get("username", "admin"), hik_password=str(hik.get("password", "")),
-            hik_channel=hik.get("channel", 1),
+            hik_channel=channel,
             main_rtsp=hik.get("main_rtsp", ""), sub_rtsp=hik.get("sub_rtsp", ""),
-            snapshot_path=hik.get("snapshot_path", "/ISAPI/Streaming/channels/101/picture"),
-            event_source=hik.get("events", "alertstream"),
+            snapshot_path=hik.get("snapshot_path", default_snapshot),
+            event_source=hik.get("events", default_events),
             playback=bool(hik.get("playback", True)), playback_track=int(hik.get("playback_track", 101)),
             audio=bool(hik.get("audio", True)), light_seconds=int(hik.get("light_seconds", 30)),
+            ptz_max_seconds=int(hik.get("ptz_max_seconds", 30)),
             ai_types=ai_types, smart_zones=smart,
             holds=Holds(motion=float(hold.get("motion", 3)), ai=float(hold.get("ai", 5)),
                         smart=float(hold.get("smart", 5))),
