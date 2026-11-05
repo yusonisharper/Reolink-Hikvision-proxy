@@ -629,6 +629,21 @@ def test_listen_on_all_interfaces_reports_the_local_ip():
     assert cam.ip == "127.0.0.1" and cam.template_vars()["ip"] == cam.ip
 
 
+def test_end_of_an_undeclared_smart_event_leaves_motion_and_people_alone():
+    """Seen on a real camera: linedetection inactive cleared the state while VMD was still active."""
+    from bcproxy import hik
+    cam, _ = _cam()
+    cam.on_alert(hik.HikAlert("VMD", "active", 1))
+    cam.on_alert(hik.HikAlert("linedetection", "active", 1, regions=[(1, "human")]))
+    cam.on_alert(hik.HikAlert("linedetection", "inactive", 1))
+    snap = cam.state.snapshot()
+    assert snap.motion and snap.ai == {"people"} and not snap.smart
+
+    cam.on_alert(hik.HikAlert("VMD", "inactive", 1))     # the end of motion itself still clears at once
+    snap = cam.state.snapshot()
+    assert not snap.motion and not snap.ai
+
+
 def test_alarms_reach_a_client_that_never_subscribed():
     """A real Reolink NVR and the app were seen logging in without ever sending 31."""
     from bcproxy import hik

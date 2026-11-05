@@ -444,7 +444,10 @@ class VirtualCamera:
             targets = frozenset(t for t in ev.targets if t in self.cfg.ai_types)
             kind = ev.kind
             if kind in SMART_TYPES and not self.cfg.smart_zones.get(kind):
-                # smart type not advertised: still report the person/vehicle as AI + motion
+                # smart type not advertised: still report the person/vehicle as AI + motion. Its end says
+                # nothing about motion, which may still be going on: what it set just runs out by itself.
+                if not ev.active:
+                    continue
                 kind = "motion"
             self.state.apply(DetEvent(kind, ev.active, ev.zone, targets))
             if ev.active and (targets or kind in SMART_TYPES):
