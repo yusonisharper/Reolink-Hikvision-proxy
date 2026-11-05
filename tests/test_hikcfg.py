@@ -629,7 +629,7 @@ def test_listen_on_all_interfaces_reports_the_local_ip():
     assert cam.ip == "127.0.0.1" and cam.template_vars()["ip"] == cam.ip
 
 
-FACE_CAPTURE = (b'{\n\t"ipAddress":\t"192.168.0.22",\n\t"channelID":\t1,\n\t"dateTime":\t"2026-11-05T14:19:17-08:00",\n'
+FACE_CAPTURE = (b'{\n\t"ipAddress":\t"192.0.2.22",\n\t"channelID":\t1,\n\t"dateTime":\t"2026-11-05T14:19:17-08:00",\n'
                 b'\t"eventState":\t"active",\n\t"eventType":\t"faceCapture",\n\t"channelName":\t"Road",\n'
                 b'\t"faceCapture":\t[{"faces":\t[{"faceId":\t30,"faceScore":\t40}]}]\n}\n')
 
