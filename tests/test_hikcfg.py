@@ -629,6 +629,57 @@ def test_listen_on_all_interfaces_reports_the_local_ip():
     assert cam.ip == "127.0.0.1" and cam.template_vars()["ip"] == cam.ip
 
 
+FACE_CAPTURE = (b'{\n\t"ipAddress":\t"192.168.0.22",\n\t"channelID":\t1,\n\t"dateTime":\t"2026-11-05T14:19:17-08:00",\n'
+                b'\t"eventState":\t"active",\n\t"eventType":\t"faceCapture",\n\t"channelName":\t"Road",\n'
+                b'\t"faceCapture":\t[{"faces":\t[{"faceId":\t30,"faceScore":\t40}]}]\n}\n')
+
+
+def test_face_capture_from_the_alert_stream_is_a_person_and_a_face():
+    """As a real camera sends it, a JSON part then JPEG parts: DS-2CD7526G0-IZHS, V5.6.12."""
+    from bcproxy import hik
+    from bcproxy.events import alarm_event_xml
+    jpeg = b"\xff\xd8" + bytes(900_000) + b"\xff\xd9"
+    stream = (b'--boundary\r\nContent-Disposition: form-data; name="faceCapture"\r\nContent-Type: application/json\r\n'
+              + b"Content-Length: %d\r\n\r\n" % len(FACE_CAPTURE) + FACE_CAPTURE
+              + b"--boundary\r\nContent-Disposition: form-data\r\nContent-Type: image/jpeg\r\n"
+              + b"Content-Length: %d\r\nContent-ID: faceImage\r\n\r\n" % len(jpeg) + jpeg + b"\r\n--boundary\r\n")
+    splitter = hik.MultipartSplitter("boundary")
+    parts = []
+    for i in range(0, len(stream), 65536):
+        parts += splitter.feed(stream[i:i + 65536])
+    alerts = [a for a in (hik.parse_part(h, b) for h, b in parts) if a]
+    assert [(a.event_type, a.state, a.channel) for a in alerts] == [("faceCapture", "active", 1)]
+
+    cam, _ = _cam(ai_types=["people", "vehicle", "face"])
+    cam.on_alert(alerts[0])
+    snap = cam.state.snapshot()
+    assert snap.motion and snap.ai == {"face", "people"}
+    assert "<AItype>people,face</AItype>" in alarm_event_xml(snap)
+    assert {k for _t, k in cam.journal.items[-2:]} == {"face", "people"}
+
+
+def test_face_capture_reports_only_what_the_camera_entry_declares():
+    from bcproxy import hik
+    cam, _ = _cam(ai_types=["people", "vehicle"])
+    cam.on_alert(hik.HikAlert("faceCapture", "active", 1))
+    assert cam.state.snapshot().ai == {"people"}
+
+
+def test_alert_parts_that_are_not_alerts_are_ignored():
+    from bcproxy import hik
+    assert hik.parse_part({"content-type": "image/jpeg"}, b"\xff\xd8") is None
+    assert hik.parse_part({"content-type": "application/json"}, b"not json") is None
+    assert hik.parse_part({"content-type": "application/json"}, b'{"a": 1}') is None
+
+
+def test_event_types_follow_what_the_camera_entry_has():
+    cam, _ = _cam(ai_types=["people", "vehicle"])
+    assert cam.event_type_bits == 1 | 1 << 1 | 1 << 2       # no smart zones, no tamper
+    assert not cam.aitype_bits & 1 << 13
+    v199 = cam.templates.render(199, cam.template_vars()).decode()
+    assert f"<eventTypeVersion>{cam.event_type_bits}</eventTypeVersion>" in v199
+
+
 def test_end_of_an_undeclared_smart_event_leaves_motion_and_people_alone():
     """Seen on a real camera: linedetection inactive cleared the state while VMD was still active."""
     from bcproxy import hik
@@ -692,7 +743,8 @@ def test_scene_change_as_tamper_on_a_camera_without_people_or_vehicle():
 
     assert asyncio.run(run()) == (True, False, True)    # only scene change on still shows as on
     assert b"<enabled>true" in fake.docs[tamper] and b"<enabled>true" in fake.docs[scene]
-    assert cam.hikcfg.has_tamper and cam.aitype_bits == 1 << 25 | 1     # no people or vehicle, motion stays
+    assert cam.hikcfg.has_tamper and cam.aitype_bits == 1 << 25 | 1 << 13 | 1     # no people or vehicle, motion stays
+    assert cam.event_type_bits == 1 | 1 << 9 | 1 << 10 | 1 << 18
 
     cam.on_alert(hik.HikAlert("sceneChangeDetection", "active", 1))
     xml = alarm_event_xml(cam.state.snapshot(), report_ai=False, report_smart=True)

@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import json
 import logging
 import os
 import re
@@ -36,7 +37,10 @@ DEFAULT_EVENT_MAP = {
     "loiteringdetection": "loitering",
     "tamperdetection": "tamper",
     "shelteralarm": "tamper",
+    "facecapture": "motion",        # a JSON part of the alert stream, see parse_alert_json
 }
+# The camera names no target for these. A face is a person too: that is what NVR push notifications can select.
+EVENT_TARGETS = {"facecapture": frozenset({"face", "people"})}
 DEFAULT_TARGET_MAP = {
     "human": "people",
     "person": "people",
@@ -327,6 +331,27 @@ def parse_alert(xml_bytes: bytes) -> HikAlert | None:
     )
 
 
+def parse_alert_json(body: bytes) -> HikAlert | None:
+    """Face captures arrive as a JSON part (eventType faceCapture), followed by JPEG parts."""
+    try:
+        doc = json.loads(body)
+    except ValueError:
+        return None
+    if not isinstance(doc, dict) or not doc.get("eventType"):
+        return None
+    channel = doc.get("channelID")
+    return HikAlert(event_type=str(doc["eventType"]), state=str(doc.get("eventState", "active")).lower(),
+                    channel=channel if isinstance(channel, int) else None, raw=body.decode("utf-8", "replace"))
+
+
+def parse_part(headers: dict[str, str], body: bytes) -> HikAlert | None:
+    """One part of the alert stream; pictures and anything else give None."""
+    ctype = headers.get("content-type", "xml")
+    if "json" in ctype:
+        return parse_alert_json(body)
+    return parse_alert(body) if "xml" in ctype else None
+
+
 @dataclass
 class EventMapper:
     event_map: dict[str, str] = field(default_factory=lambda: dict(DEFAULT_EVENT_MAP))
@@ -355,7 +380,8 @@ class EventMapper:
             if target is None and kind not in ("motion", "tamper"):
                 target = self.untargeted_smart_target
             zone = None if rid is None else max(0, rid - self.region_base)
-            out.append(DetEvent(kind, active, zone, frozenset([target]) if target else frozenset()))
+            targets = frozenset([target]) if target else frozenset()
+            out.append(DetEvent(kind, active, zone, targets | EVENT_TARGETS.get(a.event_type.lower(), frozenset())))
         return out
 
 
@@ -382,9 +408,7 @@ async def alert_stream(http: HikHttp, on_alert: Callable[[HikAlert], None],
             while True:
                 chunk = await asyncio.wait_for(it.__anext__(), idle_timeout)
                 for headers, body in splitter.feed(chunk):
-                    if "xml" not in headers.get("content-type", "xml"):
-                        continue
-                    alert = parse_alert(body)
+                    alert = parse_part(headers, body)
                     if alert:
                         on_alert(alert)
         except (StopAsyncIteration, asyncio.TimeoutError, OSError, ConnectionError, ValueError) as e:
