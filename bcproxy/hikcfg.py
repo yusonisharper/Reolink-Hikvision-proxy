@@ -37,6 +37,10 @@ def _set(doc: str, tag: str, value) -> str:
     return new
 
 
+EXTERNAL_DEVICE_PATH = "/ISAPI/System/externalDevice"
+EXTERNAL_LIGHT_ON = "on"
+
+
 def _check(status: int, body: bytes, what: str) -> None:
     if status != 200:
         raise ConnectionError(f"{what} -> HTTP {status}: {body[:200]!r}")
@@ -181,6 +185,7 @@ class HikConfig:
     ptz_type = 0                                    # PTZ is not connected for Hikvision
     has_presets = False
     has_tours = False
+    can_request_keyframe = True
 
     def __init__(self, http: HikHttp, channel: int | None = 1) -> None:
         self.http, self.channel = http, channel or 1
@@ -188,6 +193,9 @@ class HikConfig:
         self.bitrate_mode: dict[int, str] = {}    # stream -> "cbr" / "vbr"
         self.light_on_mode: str | None = None     # supplementLightMode that means "light on"
         self.has_tamper = False
+        self.scene_is_tamper = False              # scene change is reported as tamper: one switch for both
+        self._external_light = False              # the light is SupplementLight in externalDevice (DS-2CD2347G1-L)
+        self._external_saved: str | None = None   # that document as it was before the light was switched on
 
     # ----------------------------------------------------------------- status
     async def cpu_usage(self) -> int | None:
@@ -214,6 +222,11 @@ class HikConfig:
     def _stream_path(self, idx: int) -> str:
         return f"/ISAPI/Streaming/channels/{self.channel}0{idx}"
 
+    async def request_keyframe(self, idx: int) -> None:
+        """Measured on a running stream: a keyframe follows in under 0.7 s; by itself one comes every 2-5 s."""
+        status, body = await self.http.put_bytes(self._stream_path(idx) + "/requestKeyFrame", b"")
+        _check(status, body, "PUT requestKeyFrame")
+
     async def load(self) -> None:
         for idx in (1, 2):
             try:
@@ -230,6 +243,13 @@ class HikConfig:
             self.light_on_mode = next((x for x in modes if "white" in x.lower()), None)
         except Exception as e:  # noqa: BLE001 - no supplement light on this model
             log.debug("no supplement light: %s", e)
+        if not self.light_on_mode:
+            try:
+                doc = (await self.http.get_bytes(EXTERNAL_DEVICE_PATH + "/capabilities")).decode("utf-8", "replace")
+                if re.search(r"<SupplementLight>\s*<enabled\s+opt=", doc):
+                    self._external_light, self.light_on_mode = True, EXTERNAL_LIGHT_ON
+            except Exception as e:  # noqa: BLE001 - no external device on this model
+                log.debug("no external light: %s", e)
         try:
             await self.tamper_enabled()
             self.has_tamper = True
@@ -240,14 +260,33 @@ class HikConfig:
     def _tamper_path(self) -> str:
         return f"/ISAPI/System/Video/inputs/channels/{self.channel}/tamperDetection"
 
+    @property
+    def _scene_path(self) -> str:
+        return f"/ISAPI/Smart/SceneChangeDetection/{self.channel}"
+
+    async def _detection_enabled(self, path: str) -> bool:
+        return _tag((await self.http.get_bytes(path)).decode("utf-8"), "enabled") == "true"
+
+    async def _set_detection(self, path: str, enable: bool) -> None:
+        doc = (await self.http.get_bytes(path)).decode("utf-8")
+        status, body = await self.http.put_bytes(path, _set(doc, "enabled", str(enable).lower()).encode("utf-8"))
+        _check(status, body, f"PUT {path}")
+
     async def tamper_enabled(self) -> bool:
-        return _tag((await self.http.get_bytes(self._tamper_path)).decode("utf-8"), "enabled") == "true"
+        """On when anything that is reported as tamper can fire, or the app would show off while alerts come."""
+        on = await self._detection_enabled(self._tamper_path)
+        if on or not self.scene_is_tamper:
+            return on
+        try:
+            return await self._detection_enabled(self._scene_path)
+        except ConnectionError as e:  # model without scene change detection
+            log.debug("no scene change detection: %s", e)
+            return False
 
     async def set_tamper(self, enable: bool) -> None:
-        doc = (await self.http.get_bytes(self._tamper_path)).decode("utf-8")
-        status, body = await self.http.put_bytes(self._tamper_path,
-                                                 _set(doc, "enabled", str(enable).lower()).encode("utf-8"))
-        _check(status, body, "PUT tamper detection")
+        await self._set_detection(self._tamper_path, enable)
+        if self.scene_is_tamper:
+            await self._set_detection(self._scene_path, enable)
 
     async def audio_enabled(self) -> bool:
         doc = (await self.http.get_bytes(self._stream_path(1))).decode("utf-8", "replace")
@@ -488,15 +527,44 @@ class HikConfig:
         return f"/ISAPI/Image/channels/{self.channel}/supplementLight"
 
     async def light_mode(self) -> str:
+        if self._external_light:
+            doc = (await self.http.get_bytes(EXTERNAL_DEVICE_PATH)).decode("utf-8")
+            return EXTERNAL_LIGHT_ON if _tag(doc, "enabled") == "true" else "close"
         doc = (await self.http.get_bytes(self._light_path)).decode("utf-8")
         m = re.search(r"<supplementLightMode>(\w+)", doc)
         return m.group(1) if m else "close"
 
     async def set_light_mode(self, mode: str) -> None:
+        if self._external_light:
+            await self._set_external_light(mode == EXTERNAL_LIGHT_ON)
+            return
         doc = (await self.http.get_bytes(self._light_path)).decode("utf-8")
         status, body = await self.http.put_bytes(self._light_path,
                                                  _set(doc, "supplementLightMode", mode).encode("utf-8"))
         _check(status, body, f"PUT light {mode}")
+
+    async def _set_external_light(self, on: bool) -> None:
+        """enabled alone does nothing by day: mode auto waits for the dark. So a schedule that always applies
+        and a fixed brightness while on; off puts the camera's own document back."""
+        doc = (await self.http.get_bytes(EXTERNAL_DEVICE_PATH)).decode("utf-8")
+        if on:
+            self._external_saved = self._external_saved or doc
+            for tag, value in (("enabled", "true"), ("brightnessRegulateMode", "manual"), ("mode", "schedule"),
+                               ("beginTime", "00:00:00"), ("endTime", "23:59:59"),
+                               ("brightness", _tag(doc, "maxBrightness", "100"))):
+                doc = _set(doc, tag, value)
+        elif self._external_saved:
+            # in mode auto the camera ignores the schedule it is given (real camera): put the times back first
+            status, body = await self.http.put_bytes(
+                EXTERNAL_DEVICE_PATH, _set(self._external_saved, "mode", "schedule").encode("utf-8"))
+            _check(status, body, "PUT external light schedule")
+            doc = self._external_saved
+        else:
+            doc = _set(doc, "enabled", "false")
+        status, body = await self.http.put_bytes(EXTERNAL_DEVICE_PATH, doc.encode("utf-8"))
+        _check(status, body, "PUT external light")
+        if not on:
+            self._external_saved = None
 
     # -------------------------------------------------------------- recording
     @property

@@ -83,7 +83,7 @@ def test_session_and_pcap_dump(tmp_path):
         return r199, r527, r529, ev, chunks
 
     r199, r527, r529, ev, chunks = asyncio.run(run())
-    assert b"<aitype>6</aitype>" in r199.payload and b"<smartAI>2</smartAI>" in r199.payload
+    assert b"<aitype>7</aitype>" in r199.payload and b"<smartAI>2</smartAI>" in r199.payload
     assert r527.response == 200 and b"<crosslineDetectItem>" in r527.payload
     assert r529.response == 400          # intrusion not configured
     assert b"<type>crossline</type>" in ev.payload and b"<AItype>people</AItype>" in ev.payload

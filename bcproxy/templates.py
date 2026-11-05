@@ -68,7 +68,7 @@ def smart_detect_xml(stype: str, zones: list[dict], channel: int = 0) -> bytes:
     items = []
     for i, z in enumerate(zones):
         loc = int(z.get("zone", i))
-        targets = ",".join(z.get("targets") or ["people", "vehicle"])
+        targets = ",".join(z["targets"]) or "none" if "targets" in z else "people,vehicle"
         extra = ""
         if stype == "loitering":
             extra = f"<timeThresh>{int(z.get('delay', 10))}</timeThresh>\n"

@@ -194,7 +194,7 @@ class FakeVideo:
     async def ensure_info(self):
         return self.info
 
-    def subscribe(self):
+    def subscribe(self, old_key=True):
         return self.q
 
     def unsubscribe(self, q):
@@ -244,7 +244,8 @@ def test_app_flow_light_record_audio():
     assert b"<binoCfg>0</binoCfg>" in out["199"]      # single lens: no "Sync Brightness" of the Duo series
     isp = int(xml_value(out["199"], "newIspCfg"))
     assert isp & (1 << 8) and isp & (1 << 12) and not isp & (1 << 2)    # brightness, sharpen on; exposure (not wired) off
-    assert b"ledState_rw" in out["151"] and b"recordSchedule_rw" in out["151"]
+    # ledState is the LED/IR control: it would add an IR button next to the white light
+    assert b"ledState" not in out["151"] and b"recordSchedule_rw" in out["151"]
     assert out["146"].count(b"<StreamInfo>") >= 3      # FakeVideo info: sub sizes + its own size
     for k in ("40", "97", "210"):
         assert out[k]
@@ -525,3 +526,167 @@ def test_tamper_event_is_reported():
     cam, _ = _cam()
     cam.on_alert(hik.HikAlert("shelteralarm", "active", 1))
     assert "tamper" in alarm_event_xml(cam.state.snapshot())
+
+
+EXTERNAL_CAPS = (b'<ExternalDevice><SupplementLight><enabled opt="true,false">false</enabled>'
+                 b'<mode opt="schedule,auto">auto</mode></SupplementLight></ExternalDevice>')
+EXTERNAL_DOC = (b"<ExternalDevice><SupplementLight><enabled>false</enabled><brightnessRegulateMode>auto"
+                b"</brightnessRegulateMode><mode>auto</mode><Schedule><TimeRange><beginTime>18:00:00</beginTime>"
+                b"<endTime>06:00:00</endTime></TimeRange></Schedule><brightness>15</brightness>"
+                b"<maxBrightness>50</maxBrightness></SupplementLight></ExternalDevice>")
+
+
+def test_light_in_external_device_when_supplement_light_is_missing():
+    """DS-2CD2347G1-L: supplementLight answers 403, the switch is in /ISAPI/System/externalDevice."""
+    cam, fake = _cam(light_seconds=60)
+    del fake.docs["/ISAPI/Image/channels/1/supplementLight/capabilities"]
+    fake.docs["/ISAPI/System/externalDevice/capabilities"] = EXTERNAL_CAPS
+    fake.docs["/ISAPI/System/externalDevice"] = EXTERNAL_DOC
+
+    async def run():
+        await cam.hikcfg.load()
+        seen = [await cam.hikcfg.light_mode()]
+        await cam.set_light(True)
+        seen.append(fake.docs["/ISAPI/System/externalDevice"])
+        await cam.set_light(False)
+        return seen
+
+    off, on_doc = asyncio.run(run())
+    assert cam.hikcfg.light_on_mode == "on" and off == "close"
+    for part in (b"<enabled>true</enabled>", b"<mode>schedule</mode>", b"<beginTime>00:00:00</beginTime>",
+                 b"<endTime>23:59:59</endTime>", b"<brightnessRegulateMode>manual<", b"<brightness>50</brightness>"):
+        assert part in on_doc
+    assert fake.docs["/ISAPI/System/externalDevice"] == EXTERNAL_DOC and not cam.light_status   # all put back
+    assert cam.template_vars()["led_ctrl"] == 6 and cam.template_vars()["light_type"] == 1
+
+
+def test_external_device_is_not_used_when_supplement_light_exists_or_it_has_no_switch():
+    cam, fake = _cam()
+    fake.docs["/ISAPI/Image/channels/1/supplementLight/capabilities"] = (
+        b'<SupplementLight><supplementLightMode opt="colorVuWhiteLight,close">close</supplementLightMode></SupplementLight>')
+    fake.docs["/ISAPI/System/externalDevice/capabilities"] = EXTERNAL_CAPS
+    asyncio.run(cam.hikcfg.load())
+    assert cam.hikcfg.light_on_mode == "colorVuWhiteLight"
+
+    cam, fake = _cam()     # .24 answers an empty capabilities document
+    del fake.docs["/ISAPI/Image/channels/1/supplementLight/capabilities"]
+    fake.docs["/ISAPI/System/externalDevice/capabilities"] = b"<ExternalDevice></ExternalDevice>"
+    asyncio.run(cam.hikcfg.load())
+    assert cam.hikcfg.light_on_mode is None
+
+
+def test_keyframe_is_asked_for_on_a_preview_and_on_msg_189():
+    cam, fake = _cam()
+    asked = []
+
+    async def request_keyframe(idx):
+        asked.append(idx)
+
+    cam.hikcfg.request_keyframe = request_keyframe
+
+    async def run():
+        srv = await asyncio.start_server(lambda r, w: BcSession(cam, r, w).run(), "127.0.0.1", 0)
+        c = bc_client.Client("127.0.0.1", srv.sockets[0].getsockname()[1], "admin", "pw")
+        await c.connect()
+        await c.login()
+        ok = (await c.request(189, payload=bc.body_xml(
+            '<RequestIframe version="1.1">\n<channelId>0</channelId>\n<streamType>subStream</streamType>\n</RequestIframe>'))).response
+        await asyncio.sleep(0.05)
+        c.writer.close()
+        srv.close()
+        return ok
+
+    assert asyncio.run(run()) == 200 and asked == [2]
+
+
+def test_keyframe_request_failing_changes_nothing():
+    cam, _ = _cam()
+
+    async def fails(idx):
+        raise ConnectionError("HTTP 403")
+
+    cam.hikcfg.request_keyframe = fails
+    asyncio.run(cam.request_keyframe("mainStream"))
+
+
+def test_late_joiner_gets_no_old_keyframe_when_it_will_ask_for_a_new_one():
+    from bcproxy.media import StreamSource
+
+    async def run():
+        src = StreamSource("t", "rtsp://h/101", StreamInfo("H265", 640, 360, 15))
+        src._task = asyncio.create_task(asyncio.sleep(5))
+        src.last_key = AccessUnit(b"old", True)
+        new, old = src.subscribe(old_key=False), src.subscribe()
+        src._task.cancel()
+        return new.qsize(), old.qsize()
+
+    assert asyncio.run(run()) == (0, 1)
+
+
+def test_listen_on_all_interfaces_reports_the_local_ip():
+    cam, _ = _cam()
+    cam.cfg.listen_host, cam.cfg.hik_host = "0.0.0.0", "127.0.0.1"
+    assert cam.ip == "127.0.0.1" and cam.template_vars()["ip"] == cam.ip
+
+
+def test_alarms_reach_a_client_that_never_subscribed():
+    """A real Reolink NVR and the app were seen logging in without ever sending 31."""
+    from bcproxy import hik
+    cam, _ = _cam()
+
+    async def run():
+        srv = await asyncio.start_server(lambda r, w: BcSession(cam, r, w).run(), "127.0.0.1", 0)
+        c = bc_client.Client("127.0.0.1", srv.sockets[0].getsockname()[1], "admin", "pw")
+        await c.connect()
+        await c.login()
+        cam.on_alert(hik.HikAlert("shelteralarm", "active", 1))
+        msg = await asyncio.wait_for(c.events.get(), 3)
+        c.writer.close()
+        srv.close()
+        return msg
+
+    msg = asyncio.run(run())
+    assert msg.response == 200 and b"<status>tamper</status>" in msg.payload
+
+
+def test_scene_change_stays_out_of_tamper_unless_configured():
+    from bcproxy import hik
+    cam, _ = _cam()
+    cam.on_alert(hik.HikAlert("scenechangedetection", "active", 1))
+    assert not cam.state.snapshot().tamper and not cam.hikcfg.scene_is_tamper
+
+
+def test_scene_change_as_tamper_on_a_camera_without_people_or_vehicle():
+    """DS-2CD2347G1-L: no AI targets; crossline and intrusion come without one, and two detections share Tamper Alert."""
+    from bcproxy import hik
+    from bcproxy.events import alarm_event_xml
+    from bcproxy.templates import smart_detect_xml
+    zones = {"crossline": [{"zone": 0, "name": "Line", "targets": []}], "intrusion": [{"zone": 0, "name": "Area", "targets": []}]}
+    cam, fake = _cam(ai_types=[], smart_zones=zones, event_map={"sceneChangeDetection": "tamper"})
+    tamper, scene = "/ISAPI/System/Video/inputs/channels/1/tamperDetection", "/ISAPI/Smart/SceneChangeDetection/1"
+    fake.docs[tamper] = b"<TamperDetection><enabled>false</enabled></TamperDetection>"
+    fake.docs[scene] = b"<SceneChangeDetection><id>1</id><enabled>true</enabled></SceneChangeDetection>"
+
+    async def run():
+        await cam.hikcfg.load()
+        shown = await cam.hikcfg.tamper_enabled()
+        await cam.hikcfg.set_tamper(False)
+        off = await cam.hikcfg.tamper_enabled()
+        await cam.hikcfg.set_tamper(True)
+        return shown, off, await cam.hikcfg.tamper_enabled()
+
+    assert asyncio.run(run()) == (True, False, True)    # only scene change on still shows as on
+    assert b"<enabled>true" in fake.docs[tamper] and b"<enabled>true" in fake.docs[scene]
+    assert cam.hikcfg.has_tamper and cam.aitype_bits == 1 << 25 | 1     # no people or vehicle, motion stays
+
+    cam.on_alert(hik.HikAlert("sceneChangeDetection", "active", 1))
+    xml = alarm_event_xml(cam.state.snapshot(), report_ai=False, report_smart=True)
+    assert "<status>tamper</status>" in xml and "AItype" not in xml
+
+    cam.state = type(cam.state)(holds=cam.cfg.holds)
+    cam.on_alert(hik.HikAlert("linedetection", "active", 1, regions=[(1, None)]))
+    cam.on_alert(hik.HikAlert("fielddetection", "active", 1, regions=[(1, None)]))
+    snap = cam.state.snapshot()
+    assert snap.smart == (("crossline", 0, None), ("intrusion", 0, None)) and not snap.ai and snap.motion
+    assert xml_value(smart_detect_xml("crossline", zones["crossline"]), "aiType") == "none"
+    assert xml_value(smart_detect_xml("crossline", [{"zone": 0}]), "aiType") == "people,vehicle"

@@ -37,6 +37,8 @@ MSG_RECORD_CFG, MSG_RECORD_CFG_SET, MSG_COMPRESSION_SET, MSG_RECORD, MSG_RECORD_
 MSG_LIGHT_MANUAL, MSG_LIGHT_STATUS = 288, 291
 MSG_IMAGE_SET, MSG_IMAGE, MSG_IMAGE_RANGES, MSG_PORTS, MSG_PORTS_SET = 25, 26, 132, 37, 38
 MSG_TAMPER, MSG_TAMPER_SET = 763, 764
+MSG_REQUEST_IFRAME = 189
+MSG_PERFORMANCE = 122     # bitrate and CPU in the NVR's channel info
 CONTROL_IDS = {MSG_RECORD_CFG, MSG_RECORD_CFG_SET, MSG_COMPRESSION_SET, MSG_RECORD, MSG_RECORD_SET, MSG_LIGHT_MANUAL,
                MSG_IMAGE_SET, MSG_IMAGE, MSG_IMAGE_RANGES, MSG_PORTS, MSG_PORTS_SET, MSG_TAMPER, MSG_TAMPER_SET}
 MSG_PTZ_CONTROL, MSG_PTZ_PRESET, MSG_PTZ_PRESETS, MSG_ZOOM_FOCUS, MSG_ZOOM_FOCUS_SET = 18, 19, 190, 294, 295
@@ -102,12 +104,13 @@ class BcSession:
             await self.writer.drain()
 
     def push_alarm(self, snap: Snapshot) -> None:
-        if not self.alarm_req or self.writer.is_closing():
+        """To every logged-in client: a real Reolink NVR and app were seen never sending 31 (subscribe)."""
+        if self.writer.is_closing():
             return
         payload = body_xml(alarm_event_xml(snap, channel=0,
                                            report_ai=bool(self.cam.cfg.ai_types),
                                            report_smart=bool(self.cam.smartai_bits)))
-        r = self.alarm_req
+        r = self.alarm_req or BcMsg(bc.MSG_ALARM_EVENT)
         msg = BcMsg(bc.MSG_ALARM_EVENT, r.channel, r.stream_type, r.msg_num, 200, bc.CLASS_MODERN,
                     b"", payload)
         self._spawn(self.send(msg))
@@ -152,7 +155,6 @@ class BcSession:
             if self.decoder.skipped:
                 log.warning("%s: decoder skipped %d bytes (bad magic)", self.tag, self.decoder.skipped)
             log.info("%s: closing: %s (logged_in=%s)", self.tag, reason, self.logged_in)
-            self.cam.alarm_subs.discard(self)
             self.cam.sessions.discard(self)
             self.cam.ptz_release(self)
             for t in list(self.previews.values()) + list(self.tasks):
@@ -205,6 +207,7 @@ class BcSession:
             bc.MSG_ALARM_START: self.on_alarm_start,
             bc.MSG_SNAP: self.on_snap,
             MSG_ONLINE_USERS: self.on_online_users,
+            MSG_REQUEST_IFRAME: self.on_request_iframe,
         }.get(msg.msg_id)
         if handler:
             await handler(msg)
@@ -223,8 +226,8 @@ class BcSession:
             else:
                 await self.send(msg.reply(400))
             return
-        if msg.msg_id in self.cam.cfg.perf_msg_ids and not self.cam.templates.has(msg.msg_id):
-            await self.send(msg.reply(200, payload=self.cam.performance_xml(msg.msg_id)))
+        if msg.msg_id == MSG_PERFORMANCE and not self.cam.templates.has(msg.msg_id):
+            await self.send(msg.reply(200, payload=self.cam.performance_xml()))
             return
         is_write = bool(msg.payload) and not msg.binary
         if is_write:
@@ -292,7 +295,6 @@ class BcSession:
             await self.send(msg.reply(400))
             return
         self.logged_in = True
-        self.cam.sessions.add(self)
         self.username = self.cam.cfg.username
         payload = self.cam.templates.render("login_deviceinfo", self.cam.template_vars(self.username))
         await self.send(msg.reply(200, payload=payload or b""))
@@ -300,6 +302,7 @@ class BcSession:
             self.crypter.set(self.negotiated, make_aes_key(self.nonce, self.cam.cfg.password))
         else:
             self.crypter.set(self.negotiated)
+        self.cam.sessions.add(self)     # only now: alarms pushed to it must use the new key
         log.info("%s: login OK, encryption=%s", self.tag, self.crypter.mode.name)
 
     def _get_reply(self, msg_id: int) -> bytes | None:
@@ -351,7 +354,6 @@ class BcSession:
     # ---------------------------------------------------------------- alarms
     async def on_alarm_start(self, msg: BcMsg) -> None:
         self.alarm_req = msg
-        self.cam.alarm_subs.add(self)
         await self.send(msg.reply(200))
         log.info("%s: alarm subscription started", self.tag)
         self.push_alarm(self.cam.state.snapshot())
@@ -510,6 +512,10 @@ class BcSession:
             self.previews.pop(handle).cancel()
         self.previews[handle] = self._spawn(self._stream(msg, src, stype))
 
+    async def on_request_iframe(self, msg: BcMsg) -> None:
+        await self.send(msg.reply(200))
+        await self.cam.request_keyframe(xml_value(msg.payload, "streamType") or "mainStream")
+
     async def on_preview_stop(self, msg: BcMsg) -> None:
         handle = int(xml_value(msg.payload, "handle") or 0)
         t = self.previews.pop(handle, None)
@@ -524,7 +530,10 @@ class BcSession:
             log.warning("%s: %s unavailable: %s", self.tag, stype, e)
             await self.send(req.reply(400))
             return
-        q = src.subscribe()
+        can_ask = bool(self.cam.hikcfg and self.cam.hikcfg.can_request_keyframe)
+        q = src.subscribe(old_key=not can_ask)
+        if can_ask:
+            self._spawn(self.cam.request_keyframe(stype))
         log.info("%s: preview %s started", self.tag, stype)
         frames = sent = 0
         t_start = time.monotonic()

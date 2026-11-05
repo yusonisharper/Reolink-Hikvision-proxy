@@ -27,6 +27,8 @@ log = logging.getLogger("camera")
 FRAME_RATE_MODE_KEY = 25      # settings store slot (write id of the image page)
 AITYPE_BITS = {"people": 1 << 1, "vehicle": 1 << 2, "face": 1 << 3, "dog_cat": 1 << 4}
 AITYPE_TAMPER = 1 << 25       # the app's Tamper Alert (reolink_aio: aitype bit 25)
+# The app's Motion filter: libBCSDKWrapper's GetSupportMDEvent tests bit 0 of the field where GetSupportPeopleEvent tests bit 1.
+AITYPE_MOTION = 1 << 0
 SMART_BITS = {"crossline": 1 << 1, "intrusion": 1 << 2, "loitering": 1 << 3}
 
 
@@ -41,8 +43,6 @@ class CameraConfig:
     nego_class: int = 0x6614           # header class of the nonce reply (0x6614 or 0x0000)
     display_name: str | None = None    # initial name shown in NVR/app (default: name)
     sync_name_to_hik: bool = True      # rename from NVR/app also renames the Hikvision channel (OSD)
-    perf_msg_ids: tuple = ()           # msg ids answered with <Performance> (experimental, see README)
-    perf_probe: bool = False           # answer each id with marker values to find the right one
     model: str = "RLC-811A"
     hardware: str = "IPC_NT7NA58MP"
     firmware: str = "v3.0.0.4308_2506201230"
@@ -136,6 +136,8 @@ class VirtualCamera:
         http_type, config_type = (dahua.DahuaHttp, dahua.DahuaConfig) if is_dahua else (hik.HikHttp, HikConfig)
         self.http = http_type(cfg.hik_host, cfg.hik_port, cfg.hik_user, cfg.hik_password) if cfg.hik_host else None
         self.hikcfg = config_type(self.http, cfg.hik_channel) if self.http else None
+        if self.hikcfg and not is_dahua:
+            self.hikcfg.scene_is_tamper = self.mapper.event_map.get("scenechangedetection") == "tamper"
         self.audio = AudioSource(f"{cfg.name}/audio", cfg.main_rtsp) if cfg.audio and cfg.main_rtsp else None
         self.audio_on = False               # Hikvision main stream carries audio
         self.light_status = False
@@ -156,7 +158,6 @@ class VirtualCamera:
                 else HikRecordings(self.http, cfg.playback_track)
         # detections with time, to label playback files people/vehicle/...
         self.journal = EventJournal(self.settings.dir / "events.jsonl" if self.settings.dir else None)
-        self.alarm_subs: set = set()        # BcSession objects
         self.sessions: set = set()          # all logged-in BcSessions (msg 120 online users)
         self.last_snapshot = Snapshot()
         self.uid = cfg.uid
@@ -424,6 +425,14 @@ class VirtualCamera:
             if video_changed:
                 src.reconfigure(StreamInfo(codec, w, h, fps))
 
+    async def request_keyframe(self, stream_type: str) -> None:
+        if not self.hikcfg or not self.hikcfg.can_request_keyframe:
+            return
+        try:
+            await self.hikcfg.request_keyframe(1 if stream_type == "mainStream" else 2)
+        except (OSError, asyncio.TimeoutError, ValueError) as e:  # the next keyframe just comes by itself
+            log.debug("%s: request keyframe: %s", self.cfg.name, e)
+
     # ---------------------------------------------------------------- events
     def on_alert(self, alert: hik.HikAlert) -> None:
         evs = self.mapper.map(alert)
@@ -459,17 +468,15 @@ class VirtualCamera:
                     warned = True
             await asyncio.sleep(interval)
 
-    def performance_xml(self, msg_id: int) -> bytes:
-        if self.cfg.perf_probe:     # e.g. 112 -> CPU 12 %, 1112 kbps
-            cpu, rate, net = msg_id % 100, 1000 + msg_id, 1000 + msg_id
-        else:
-            main = self.main.rate.kbps() if self.main else None
-            rate = main if main is not None else (self.hik_bitrate or 0)
-            cpu = self.hik_cpu if self.hik_cpu is not None else 0
-            net = self.tx.kbps() or 0
-        return body_xml(f'<Performance version="1.1">\n<channelId>0</channelId>\n'
-                        f"<cpuUsed>{cpu}</cpuUsed>\n<netThroughput>{net}</netThroughput>\n"
-                        f"<codecRate>{rate}</codecRate>\n</Performance>")
+    def performance_xml(self) -> bytes:
+        """122 reply; names from libBCSDKWrapper's PerformanceInfo parser. Bitrate as measured while somebody
+        watches, otherwise as configured on the camera."""
+        main = self.main.rate.kbps() if self.main else None
+        rate = main if main is not None else (self.hik_bitrate or 0)
+        cpu = self.hik_cpu if self.hik_cpu is not None else 0
+        return body_xml(f'<PerformanceInfo version="1.1">\n<cpuUseRate>{cpu}</cpuUseRate>\n'
+                        f"<codeRate>{rate}</codeRate>\n<netDataRate>{self.tx.kbps() or 0}</netDataRate>\n"
+                        "</PerformanceInfo>")
 
     async def _ticker(self) -> None:
         while True:
@@ -481,15 +488,15 @@ class VirtualCamera:
         if snap == self.last_snapshot:
             return
         self.last_snapshot = snap
-        log.info("%s: state motion=%s ai=%s smart=%s", self.cfg.name, snap.motion,
+        log.info("%s: state motion=%s tamper=%s ai=%s smart=%s", self.cfg.name, snap.motion, snap.tamper,
                  ",".join(sorted(snap.ai)) or "-", snap.smart or "-")
-        for s in list(self.alarm_subs):
+        for s in list(self.sessions):
             s.push_alarm(snap)
 
     # -------------------------------------------------------------- template
     @property
     def aitype_bits(self) -> int:
-        bits = sum(AITYPE_BITS[t] for t in self.cfg.ai_types if t in AITYPE_BITS)
+        bits = sum(AITYPE_BITS[t] for t in self.cfg.ai_types if t in AITYPE_BITS) | AITYPE_MOTION
         return bits | (AITYPE_TAMPER if self.hikcfg and self.hikcfg.has_tamper else 0)
 
     @property
@@ -544,7 +551,6 @@ class VirtualCamera:
             "no_audio": 0 if self.audio else 1, "audio_version": 31 if self.audio else 0,
             "led_ctrl": 6 if self.hikcfg and self.hikcfg.light_on_mode else 0,
             "light_type": 1 if self.hikcfg and self.hikcfg.light_on_mode else 0,
-            "light_ability": ", ledState_rw" if self.hikcfg and self.hikcfg.light_on_mode else "",
             "light_seconds": self.cfg.light_seconds,
             "disk_num": 1 if self.recordings else 0, "record_ver": 3 if self.recordings else 0,
             "replay_version": 21 if self.recordings else 0,

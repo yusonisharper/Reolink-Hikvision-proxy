@@ -218,7 +218,9 @@ class StreamSource:
                      self.info.height, self.info.fps)
         return self.info
 
-    def subscribe(self) -> asyncio.Queue:
+    def subscribe(self, old_key: bool = True) -> asyncio.Queue:
+        """old_key: a late joiner starts from the last keyframe. It shows at once, but the frames after it do
+        not follow from it. A caller that can ask the camera for a new keyframe does better without it."""
         q: asyncio.Queue = asyncio.Queue(maxsize=300)
         self.subs.add(q)
         if self._stop_handle:
@@ -226,8 +228,8 @@ class StreamSource:
             self._stop_handle = None
         if self._task is None or self._task.done():
             self._task = asyncio.create_task(self._run(), name=f"ffmpeg-{self.name}")
-        elif self.last_key is not None:
-            q.put_nowait((time.monotonic(), self.last_key))   # instant picture for late joiners
+        elif old_key and self.last_key is not None:
+            q.put_nowait((time.monotonic(), self.last_key))
         return q
 
     def unsubscribe(self, q: asyncio.Queue) -> None:

@@ -72,8 +72,6 @@ def load(path: str) -> AppConfig:
             nego_class=int(str(c.get("nego_class", "0x6614")), 0),
             display_name=c.get("display_name"),
             sync_name_to_hik=bool(hik.get("sync_name", True)),
-            perf_msg_ids=tuple(int(x) for x in (c.get("performance") or {}).get("msg_ids", [])),
-            perf_probe=bool((c.get("performance") or {}).get("probe", False)),
             **{k: str(c[k]) for k in ("model", "hardware", "firmware", "build_day", "detail", "serial", "uid", "mac")
                if k in c},
             vendor=vendor, hik_host=hik.get("host", ""), hik_port=int(hik.get("port", 80)),

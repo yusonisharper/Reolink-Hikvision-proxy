@@ -20,6 +20,7 @@
 | `fielddetection`、`regionEntrance` | human / vehicle | `intrusion` |
 | `loitering` | human / vehicle | `loitering` |
 | `shelteralarm`、`tamperdetection` | – | `<status>tamper</status>` |
+| `scenechangedetection`（需配置 `event_map: {sceneChangeDetection: tamper}`） | – | `<status>tamper</status>`，App 的 Tamper Alert 开关同时控制遮挡和场景变更 |
 
 - 海康 `regionID`（从 1 开始）映射为 Reolink 区域编号 `zone`（从 0 开始）。
 - 越界这类单次脉冲告警会保持 `hold.smart` 秒，让 NVR 有时间触发录像；VMD 收到 `inactive` 时立即清除。
@@ -122,7 +123,7 @@ python tools/bc_client.py 127.0.0.1 -p change-me --preview subStream --out sub.h
 | 摄像头改名 | ✅ 已验证 | 保存到 `state_dir`，并同步修改海康通道名称（`hik.sync_name`） |
 | AI / 智能侦测事件 | 🟡 代码完成 | msg 31/33；还需要在 NVR 上确认录像触发和图标显示 |
 | 码流设置页（56 / 146） | 🟡 待验证 | v7 补了 `videoEncType`，码率改为读取海康的实际配置 |
-| 码率 / CPU 占用 | ❌ 未适配 | 112、132 回复 `<Performance>` 无效（真机抓包显示 112 = Compression、132 = 图像参数） |
+| 码率 / CPU 占用 | 🟡 待 NVR 确认 | 122 回复 `<PerformanceInfo>`（`cpuUseRate`、`codeRate`、`netDataRate`），消息号和字段来自 Reolink Client 的 SDK；大华拿不到 CPU，显示 0 |
 | App 设置页 | 🟡 待验证 | 37 端口、42 邮件、46 移动侦测、52 隐私遮挡、76 网络、112 码流、120 在线用户、132 图像，格式按真机抓包 |
 | 码流分辨率 | 🟡 待 App 验证 | 146 列出海康提供的全部主码流分辨率（子码流和真机一样不可选）；57 写入后改海康的分辨率、帧率、码率并重连视频。App 发的 `videoEncType`、`encoderType` 不可信，不处理 |
 | 录像设置页 | 🟡 待 App 验证 | 81/82 ↔ 海康录像计划（Normal=CMR，其余类型=EDR），54/55 ↔ 覆盖、预录、延录 |
@@ -152,7 +153,9 @@ python tools/bc_client.py 127.0.0.1 -p change-me --preview subStream --out sub.h
 ### 协议上踩过的坑
 
 - **同一连接的并发：** 读循环不等请求处理完，否则慢请求期间连 socket 都不读，PTZ 的 `stop` 进不了处理。登录除外：下一条消息的解密依赖它。
-- **回放筛选类型：** 14 的 `<recordType>` 要列出 `crossline,intrusion,loitering`；片段的 `recordType` 保留 `md`，只有 `sched` 在有其他类型时才去掉。
+- **回放筛选类型：** 14 的 `<recordType>` 要列出 `crossline,intrusion,loitering`；片段的 `recordType` 保留 `md`，只有 `sched` 在有其他类型时才去掉。199 的 `aitype` 第 0 位是 Motion：Reolink Client 的 SDK 里，`GetSupportMDEvent` 读这一位，`GetSupportPeopleEvent` 读同一字段的第 1 位。
+- **灯和红外按钮：** 白光灯来自 199 的 `ledCtrl` 和 `lightType`。151 的 `ledState` 是 LED/红外控制，声明它会多出红外按钮，所以不声明。海康的白光灯通常在 `supplementLight`；DS-2CD2347G1-L 没有这个接口（HTTP 403），开关在 `/ISAPI/System/externalDevice` 的 `SupplementLight`。它的 `auto` 模式白天不亮，所以开灯时改成全天 `schedule` 和手动亮度，关灯时写回原配置。
+- **告警推送：** 日志里真实的 NVR 和手机 App 登录后都没有发过 31（订阅），所以 33 推给所有已登录的连接，不等订阅。
 
 - **回放切换文件**：真机只发一次 `replayStreamInfo`，下一个文件开始时帧头最后一个字段（文件编号）变化，`micros` 换新基准，I 帧带该文件的真实时间，没有其他消息（Duo 2 抓包）。代理目前不做自动切换，这里只作记录。若要做，海康的一条 RTSP 流能无缝跨过录像空档，需加 `-use_wallclock_as_timestamps 1` 避免时间戳报错。
 - **回放片段结束**：海康的 RTSP 回放到 `endtime` 后既不发帧也不断开，要靠超时判断结束。

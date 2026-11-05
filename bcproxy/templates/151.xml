@@ -19,7 +19,7 @@ ${record_ability}${ptz_ability}<network>
 <image>
 <subModule>
 <channelId>0</channelId>
-<abilityValue>ispBasic_rw, ispAdvance_rw${light_ability}</abilityValue>
+<abilityValue>ispBasic_rw, ispAdvance_rw</abilityValue>
 </subModule>
 </image>
 <video>

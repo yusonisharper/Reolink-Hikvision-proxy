@@ -27,6 +27,8 @@ cameras:
   - name: driveway
     # 每台虚拟摄像头建议用独立 IP（macvlan / ip addr add），端口保持 9000，
     # NVR 手动添加时填这个 IP，协议选 Reolink。
+    # 写 0.0.0.0:<端口> 就不用填本机 IP：监听所有网卡，换电脑也不用改，上报的 IP 会自动匹配。
+    # 不要写 localhost：那样只有本机能连。
     listen: 192.168.1.201:9000
     username: admin            # NVR 添加摄像头时填写的用户名/密码
     password: "change-me"
@@ -35,11 +37,6 @@ cameras:
 
     # 设备身份（NVR 会显示，部分功能可能按型号判断）
     model: RLC-811A
-    # 实验性：用 <Performance> 回复这些消息 ID（NVR 通道信息里的码率 / CPU）。
-    # 已实测 112/132 不生效，默认关闭；拿到真机结构后再启用。见 README“兼容性状态”。
-    # performance:
-    #   msg_ids: [112, 132]
-    #   probe: false
     # display_name: 车道      # NVR/App 里显示的初始名称，默认用 name；在 NVR/App 里改名后以 state 为准
     # uid: 95270000ABCDEFGH    # P2P UID。默认不填 = 只能用 IP 连接（App/NVR 用 UID 连会走 P2P，连不上）
     # mac: EC:71:DB:12:34:56   # 局域网搜索结果里的 MAC；不填则由 name 生成，固定不变
@@ -87,6 +84,9 @@ cameras:
 
       # 覆盖默认映射（键不区分大小写）
       # event_map: {regionExiting: intrusion, PIR: motion}
+      # 场景变更也报成 Tamper Alert，App 的开关会同时控制海康的遮挡和场景变更侦测：
+      # event_map: {sceneChangeDetection: tamper}
+      # 没有人/车识别的型号：ai_types: []，smart 的 targets 写 []
       # target_map: {nonMotorVehicle: people}
 
   # 大华摄像头：把 hik: 换成 dahua:，其余（listen、events 等）含义相同。

@@ -54,7 +54,7 @@ class FakeSrc:
     async def ensure_info(self):
         return self.info
 
-    def subscribe(self):
+    def subscribe(self, old_key=True):
         for i in range(3):
             self.q.put_nowait((i / 15, AccessUnit(b"\x00\x00\x00\x01\x65" + bytes(5000) if i == 0
                                                   else b"\x00\x00\x00\x01\x41" + bytes(800), i == 0)))

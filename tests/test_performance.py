@@ -1,16 +1,36 @@
-"""<Performance> (bitrate / CPU shown in the NVR channel info)."""
+"""<PerformanceInfo> (bitrate / CPU shown in the NVR channel info)."""
 import asyncio
+import importlib.util
+from pathlib import Path
 
 from bcproxy.bc import xml_value
 from bcproxy.camera import CameraConfig, VirtualCamera
 from bcproxy.media import RateMeter
+from bcproxy.session import BcSession
+
+spec = importlib.util.spec_from_file_location("bc_client", Path(__file__).parent.parent / "tools" / "bc_client.py")
+bc_client = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(bc_client)
 
 
-def test_probe_values_identify_msg_id():
-    cam = VirtualCamera(CameraConfig(name="t", perf_probe=True))
-    p112, p132 = cam.performance_xml(112), cam.performance_xml(132)
-    assert xml_value(p112, "cpuUsed") == "12" and xml_value(p112, "codecRate") == "1112"
-    assert xml_value(p132, "cpuUsed") == "32" and xml_value(p132, "codecRate") == "1132"
+def test_msg_122_answers_performance_info(tmp_path):
+    cam = VirtualCamera(CameraConfig(name="t", password="pw", main_rtsp="rtsp://x/1"), state_dir=str(tmp_path))
+    cam.hik_cpu, cam.hik_bitrate = 23, 4096
+
+    async def run():
+        srv = await asyncio.start_server(lambda r, w: BcSession(cam, r, w).run(), "127.0.0.1", 0)
+        c = bc_client.Client("127.0.0.1", srv.sockets[0].getsockname()[1], "admin", "pw")
+        await c.connect()
+        await c.login()
+        rep = await c.request(122)
+        c.writer.close()
+        srv.close()
+        return rep
+
+    rep = asyncio.run(run())
+    assert rep.response == 200 and b"<PerformanceInfo" in rep.payload
+    assert xml_value(rep.payload, "cpuUseRate") == "23" and xml_value(rep.payload, "codeRate") == "4096"
+    assert int(xml_value(rep.payload, "netDataRate")) >= 0
 
 
 def test_rate_meter():
@@ -42,16 +62,16 @@ def test_real_values_from_stream_and_hik(tmp_path):
             await asyncio.sleep(0.02)
             if cam.hik_bitrate is not None:
                 break
-        idle = cam.performance_xml(112)          # no live stream: configured bitrate
+        idle = cam.performance_xml()             # no live stream: configured bitrate
         cam.main.rate.add(500_000)               # live stream: measured
-        live = cam.performance_xml(112)
+        live = cam.performance_xml()
         t.cancel()
         srv.close()
         return idle, live
 
     idle, live = asyncio.run(run())
-    assert xml_value(idle, "cpuUsed") == "23" and xml_value(idle, "codecRate") == "4096"
-    assert xml_value(live, "codecRate") == "4000"
+    assert xml_value(idle, "cpuUseRate") == "23" and xml_value(idle, "codeRate") == "4096"
+    assert xml_value(live, "codeRate") == "4000"
 
 
 def test_encoder_templates_use_codec_and_hik_bitrate():
