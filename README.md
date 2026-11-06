@@ -1,217 +1,218 @@
 # reolink-hik-proxy
 
-把海康威视和大华摄像头伪装成 Reolink 摄像头，让 Reolink NVR 用原生 Reolink 协议（Baichuan, TCP 9000）接入。重点是**事件映射**：人形/车辆识别、越界、区域入侵、徘徊会被翻译成 Reolink 的 AI 和智能侦测事件，而不是 ONVIF 只能传的 motion。
+**English** | [简体中文](README.zh-CN.md)
 
-下文未特别说明时讲的都是海康；大华见[大华摄像头](#大华摄像头)。
+Makes Hikvision and Dahua cameras look like Reolink cameras, so a Reolink NVR can add them over the native Reolink protocol (Baichuan, TCP 9000). The main point is **event mapping**: people and vehicle detection, line crossing, intrusion and loitering become Reolink AI and smart detection events, instead of the plain motion that ONVIF can carry.
+
+Unless stated otherwise, this document describes Hikvision. For Dahua, see [Dahua cameras](#dahua-cameras).
 
 ```
-海康 IPC ──ISAPI alertStream / HTTP 推送──┐
-        ──RTSP 主/子码流 (ffmpeg -c copy)──┼─▶ bcproxy ──Baichuan :9000──▶ Reolink NVR
-        ──ISAPI 抓图──────────────────────┘
+Hikvision IPC ──ISAPI alertStream / HTTP push──┐
+              ──RTSP main/sub (ffmpeg -c copy)─┼─▶ bcproxy ──Baichuan :9000──▶ Reolink NVR
+              ──ISAPI snapshot─────────────────┘
 ```
 
-## 事件映射
+## Event mapping
 
-| 海康 eventType | 目标 (detectionTarget) | Reolink msg 33 输出 |
+| Hikvision eventType | Target (detectionTarget) | Reolink msg 33 output |
 |---|---|---|
-| `VMD` | 无 | `<status>MD</status>` |
-| `VMD`（AcuSense） | human / vehicle | `MD` + `<AItype>people</AItype>` / `vehicle` |
-| `linedetection` | human / vehicle | `<smartAiType><type>crossline</type>` + 区域 + 目标，同时上报 AItype 和 MD |
-| `fielddetection`、`regionEntrance` | human / vehicle | `intrusion` |
+| `VMD` | none | `<status>MD</status>` |
+| `VMD` (AcuSense) | human / vehicle | `MD` + `<AItype>people</AItype>` / `vehicle` |
+| `linedetection` | human / vehicle | `<smartAiType><type>crossline</type>` + zone + target, along with AItype and MD |
+| `fielddetection`, `regionEntrance` | human / vehicle | `intrusion` |
 | `loitering` | human / vehicle | `loitering` |
-| `shelteralarm`、`tamperdetection` | – | `<status>tamper</status>` |
-| `scenechangedetection`（需配置 `event_map: {sceneChangeDetection: tamper}`） | – | `<status>tamper</status>`，App 的 Tamper Alert 开关同时控制遮挡和场景变更 |
-| `faceCapture`（JSON 格式，后面跟 JPEG） | face + people | 同时上报人和人脸，这样 NVR 的 Person 推送也会触发；`ai_types` 里没有的类型不上报 |
+| `shelteralarm`, `tamperdetection` | – | `<status>tamper</status>` |
+| `scenechangedetection` (needs `event_map: {sceneChangeDetection: tamper}`) | – | `<status>tamper</status>`; the app's Tamper Alert switch controls both tamper and scene change |
+| `faceCapture` (JSON, followed by JPEG) | face + people | Reported as both person and face, so the NVR's Person notification fires too; types not in `ai_types` are not reported |
 
-- 海康 `regionID`（从 1 开始）映射为 Reolink 区域编号 `zone`（从 0 开始）。
-- 越界这类单次脉冲告警会保持 `hold.smart` 秒，让 NVR 有时间触发录像；VMD 收到 `inactive` 时立即清除。
-- NVR 是否认为摄像头支持这些功能，取决于 msg 199 `<Support>` 中的 `<aitype>`（bit1=人, bit2=车, bit4=猫狗）和 `<smartAI>`（bit1=越界, bit2=入侵, bit3=徘徊）。这两个值根据配置里的 `ai_types` 和 `smart` 自动生成；msg 527/529/531 的区域列表也由配置生成。
+- Hikvision's `regionID` (from 1) maps to the Reolink zone number `zone` (from 0).
+- One-shot alerts such as line crossing are held for `hold.smart` seconds, so the NVR has time to start recording; VMD clears immediately on `inactive`.
+- Whether the NVR considers a camera capable of these features depends on `<aitype>` (bit 1 = people, bit 2 = vehicle, bit 4 = dog/cat) and `<smartAI>` (bit 1 = line crossing, bit 2 = intrusion, bit 3 = loitering) in `<Support>` of msg 199. Both values are generated from `ai_types` and `smart` in the config, and so are the zone lists of msg 527/529/531.
 
-## 大华摄像头
+## Dahua cameras
 
-配置里把 `hik:` 换成 `dahua:` 即可，示例见 `config.example.yaml`。
+Replace `hik:` with `dahua:` in the config. See `config.example.yaml` for an example.
 
 ```
-大华 IPC ──eventManager.cgi 事件流─────────────┐
-        ──RTSP 主/子码流 (ffmpeg -c copy)──────┼─▶ bcproxy ──Baichuan :9000──▶ Reolink NVR
-        ──snapshot / configManager / mediaFileFind┘
+Dahua IPC ──eventManager.cgi event stream──────┐
+          ──RTSP main/sub (ffmpeg -c copy)─────┼─▶ bcproxy ──Baichuan :9000──▶ Reolink NVR
+          ──snapshot / configManager / mediaFileFind┘
 ```
 
-| 大华事件 Code | 目标 | Reolink msg 33 输出 |
+| Dahua event Code | Target | Reolink msg 33 output |
 |---|---|---|
-| `VideoMotion` | 无 | `MD` |
-| `SmartMotionHuman` / `SmartMotionVehicle` | 由 Code 决定 | `MD` + `people` / `vehicle` |
+| `VideoMotion` | none | `MD` |
+| `SmartMotionHuman` / `SmartMotionVehicle` | from the Code | `MD` + `people` / `vehicle` |
 | `CrossLineDetection` | `Object.ObjectType` | `crossline` |
 | `CrossRegionDetection` | `Object.ObjectType` | `intrusion` |
 | `WanderDetection` | `Object.ObjectType` | `loitering` |
 | `VideoBlind` | – | `tamper` |
 
-大华的 `Start` / `Stop` 只各发一次，代理在两者之间每秒重复一次事件，效果和海康的持续告警相同；超过 10 分钟没等到 `Stop` 则认为丢失。除普通移动外，`Stop` 不会立刻清除状态，而是等 `hold` 保持时间结束。
+Dahua sends `Start` and `Stop` once each. The proxy repeats the event every second in between, which works the same as Hikvision's continuous alerts, and treats the `Stop` as lost after 10 minutes. Except for plain motion, `Stop` does not clear the state right away: it waits for the `hold` time to end.
 
-**状态：** 在一台真机（Amcrest `IP4M-1083E-AI`，即大华 SD5A432XB-HNR，固件 2.810，2560×1440 H.265）上用 `tools/bc_client.py` 验证过读取、预览和 PTZ；还没有接过 Reolink NVR / App，写入设置和人/车、智能事件也没有在真机上触发过。其余部分只用 `tools/fake_dahua.py` 测试过，不同型号和固件可能有差异。第一次接新型号时用 `-v` 运行，重点看事件的 `RuleId` 是否对应 `region_base`，以及 `encode.cgi getConfigCaps` 能否解析出分辨率（解析不出时只提供当前分辨率）。
+**Status:** Reading, preview and PTZ were verified with `tools/bc_client.py` on one real camera (Amcrest `IP4M-1083E-AI`, a rebranded Dahua SD5A432XB-HNR, firmware 2.810, 2560×1440 H.265). It has not been connected to a Reolink NVR or app, and writing settings and people, vehicle and smart events have not been triggered on a real camera. The rest was only tested with `tools/fake_dahua.py`, and other models and firmware may differ. When connecting a new model for the first time, run with `-v`, and check that the `RuleId` of events matches `region_base` and that `encode.cgi getConfigCaps` yields resolutions (if it cannot be parsed, only the current resolution is offered).
 
-| 功能 | 大华 |
+| Feature | Dahua |
 |---|---|
-| 主/子码流预览、抓图 | ✅ 真机验证（`bc_client`，未接 NVR / App） |
-| 声音、AI / 智能事件 | 🟡 已接，待真机验证（事件流已连通，只收到过 `NewFile`） |
-| SD 卡回放 | 🟡 录像查询和容量已在真机读到；RTSP `/cam/playback` 回放待验证 |
-| 码流（分辨率、帧率、码率、CBR/VBR、声音开关） | 🟡 能力和当前值已在真机读到；写入 `Encode` 待验证 |
-| 图像页 | 🟡 只接亮度、对比度、饱和度、锐度、镜像、翻转、日夜模式；其余不生效 |
-| Tamper Alert 开关、改名 | 🟡 写到 `BlindDetect`、`ChannelTitle`，待真机验证 |
-| PTZ：方向、变焦、转到预置点 | ✅ App 已测（变焦滑块未单独确认） |
-| PTZ：保存/删除预置点、巡航 | 🟡 大华侧已在真机验证，App 待验证（见下） |
-| PTZ：手动对焦 | ❌ 未接 |
-| 录像计划和录像设置（54/55/81/82） | ❌ 未接，不向 App 声明；请在大华网页上设置 |
-| 服务端口（37/38）、手动灯、CPU 占用、HTTP 推送事件 | ❌ 未接 |
+| Main/sub stream preview, snapshot | ✅ Verified on a real camera (`bc_client`, no NVR or app) |
+| Audio, AI and smart events | 🟡 Connected, to be verified on a real camera (the event stream connects, only `NewFile` seen so far) |
+| SD card playback | 🟡 Recording search and capacity read on a real camera; RTSP `/cam/playback` to be verified |
+| Streams (resolution, frame rate, bitrate, CBR/VBR, audio switch) | 🟡 Capabilities and current values read on a real camera; writing `Encode` to be verified |
+| Image page | 🟡 Only brightness, contrast, saturation, sharpness, mirror, flip and day/night; the rest has no effect |
+| Tamper Alert switch, renaming | 🟡 Writes `BlindDetect` and `ChannelTitle`, to be verified on a real camera |
+| PTZ: direction, zoom, go to preset | ✅ Tested in the app (the zoom slider not confirmed separately) |
+| PTZ: save/delete presets, patrols | 🟡 Verified on the Dahua side on a real camera, the app to be verified (see below) |
+| PTZ: manual focus | ❌ Not connected |
+| Recording schedule and settings (54/55/81/82) | ❌ Not connected and not declared to the app; set them on the Dahua web page |
+| Server ports (37/38), manual light, CPU usage, HTTP push events | ❌ Not connected |
 
-注意：大华连续登录失败可能锁定账号，密码填错时代理的重连可能触发锁定。
+Note: Dahua may lock the account after repeated failed logins, and with a wrong password the proxy's reconnects can trigger that.
 
 ### PTZ
 
-| Baichuan 消息 | 大华 |
+| Baichuan message | Dahua |
 |---|---|
-| 18 `PtzControl`（left/right/up/down/斜向/stop、速度 1–64） | `ptz.cgi` start/stop，速度换算为 1–8 |
-| 18 变焦（zoomIn/zoomInc、zoomOut/zoomDec） | `ZoomTele` / `ZoomWide` |
-| 190 / 19 `toPos`、`setPos`、`delPos` | `getPresets` / `GotoPreset`、`SetPreset` + `PtzPreset[].Name`、`ClearPreset`（只显示和操作 1–128 号） |
+| 18 `PtzControl` (left/right/up/down/diagonals/stop, speed 1–64) | `ptz.cgi` start/stop, speed scaled to 1–8 |
+| 18 zoom (zoomIn/zoomInc, zoomOut/zoomDec) | `ZoomTele` / `ZoomWide` |
+| 190 / 19 `toPos`, `setPos`, `delPos` | `getPresets` / `GotoPreset`, `SetPreset` + `PtzPreset[].Name`, `ClearPreset` (only presets 1–128 are shown and changed) |
 | 18 `startPatrol` / `stopPatrol` + `patrolId` | `StartTour` / `StopTour` |
-| `<PtzCruise>`（写入按标签识别，读取的消息号见下） | `PtzTour` 配置表 |
-| 294 / 295 `zoomPos` | `ZoomMapValue`（0–16384）/ 见下 |
+| `<PtzCruise>` (writes are recognized by tag, for the read message ids see below) | `PtzTour` config table |
+| 294 / 295 `zoomPos` | `ZoomMapValue` (0–16384) / see below |
 
-- **依据：** `ptzType=2`、`ptzPreset` 来自 reolink_aio；命令名和 `PtzCruise`、`PtzPreset` 的字段来自 Reolink Client 的 `libBCSDKWrapper.dll`。`ptzMode=pt`、`ptzControl`、`ptzCfg` 没有真机抓包。App 发来不认识的命令时，日志会打印 `PTZ msg ... failed` 和完整 XML，按它补 `dahua.PTZ_CODES`。
-- **安全：** 移动时客户端断开会立即停止；超过 `ptz_max_seconds`（默认 30 秒）没收到 stop 也会停止；停止失败重试 3 次。代理被强杀时无法发送停止命令。
-- **预置点：** App 只看到 1–128 号，保存和删除也只接受这个范围，之后的预置点留在摄像头上不动。保存到已有编号会覆盖它。
-- **巡航：** 对应大华 Tour，只列出有预置点的路线，数量上限取 `caps.TourMax`。这台机的驻留时间最少 15 秒，写入更小的值会被抬到 15。
-- **巡航的两套编号（真机确认）：** App 的 `patrolId` 从 0 开始，大华 Tour 从 1 开始。`PtzTour` 表里的预置点是从 0 开始的序号（预置点 7 存成 6，`-1` 表示空），写错了不会报错，摄像头只会去错位置。
-- **巡航读取：** App 打开 PTZ 面板时会依次发 294、190、64。64 返回空内容时，面板提示 “failed to load”，所以按巡航读取回复 `<PtzCruise>`（`session.MSG_CRUISE_READS`）。
-- **绝对变焦：** 这台机的 `PositionABS` 不能设置变焦，每次调用都只放大一档，与 `arg3` 无关，所以 295 用定时脉冲加读回修正（`ZOOM_RATE`）。实测广角到中段误差约 70，长焦端约 600（满量程 16384）。速度参数对变焦几乎没有影响。
-- `getStatus` 的 `MoveStatus` 在转到预置点时会过早显示 Idle，判断到位要看位置是否稳定。
-- 摄像头自己的归位任务（PtzAutoMovement）不受代理控制，可能在 App 操作后把画面转回去。
+- **Sources:** `ptzType=2` and `ptzPreset` come from reolink_aio; command names and the fields of `PtzCruise` and `PtzPreset` come from `libBCSDKWrapper.dll` of Reolink Client. `ptzMode=pt`, `ptzControl` and `ptzCfg` have no capture from a real camera. When the app sends an unknown command, the log prints `PTZ msg ... failed` with the full XML: add it to `dahua.PTZ_CODES`.
+- **Safety:** Movement stops at once when the client disconnects, and also when no stop arrives within `ptz_max_seconds` (default 30 s). A failed stop is retried 3 times. A proxy that is killed cannot send a stop.
+- **Presets:** The app only sees presets 1–128, and saving and deleting only accept that range. Later presets stay untouched on the camera. Saving to an existing number overwrites it.
+- **Patrols:** These map to Dahua Tours. Only routes with presets are listed, up to `caps.TourMax`. On this camera the minimum dwell time is 15 s, and smaller values are raised to 15.
+- **Two numbering schemes in patrols (confirmed on a real camera):** The app's `patrolId` starts at 0, Dahua's Tour at 1. Presets in the `PtzTour` table are zero-based (preset 7 is stored as 6, `-1` means empty). Getting this wrong raises no error: the camera just goes to the wrong place.
+- **Reading patrols:** When the app opens its PTZ panel, it sends 294, 190 and 64 in turn. If 64 returns nothing, the panel says "failed to load", so patrol reads are answered with `<PtzCruise>` (`session.MSG_CRUISE_READS`).
+- **Absolute zoom:** `PositionABS` on this camera cannot set the zoom: every call zooms in one step, whatever `arg3` is. So 295 uses timed pulses with correction from reading the position back (`ZOOM_RATE`). The measured error is about 70 from wide to mid range and about 600 at the tele end (full scale 16384). The speed parameter has almost no effect on zoom.
+- `MoveStatus` of `getStatus` reports Idle too early when going to a preset. To tell whether it arrived, check that the position has stopped changing.
+- The camera's own return-home task (PtzAutoMovement) is outside the proxy's control and may turn the view back after an app operation.
 
-## 快速开始
+## Quick start
 
 ```bash
-pip install -r requirements.txt        # cryptography + PyYAML；另需 ffmpeg/ffprobe
-cp config.example.yaml config.yaml     # 填海康地址/账号/RTSP、虚拟摄像头的 IP 和密码
+pip install -r requirements.txt        # cryptography + PyYAML; ffmpeg/ffprobe are also required
+cp config.example.yaml config.yaml     # fill in Hikvision address/account/RTSP, the virtual camera's IP and password
 python -m bcproxy -c config.yaml -v
 ```
 
-然后在 Reolink NVR 中手动添加摄像头：填 `listen` 中的 IP，端口 9000，用户名和密码与配置中的 `username` / `password` 一致。
+Then add the camera manually in the Reolink NVR: use the IP from `listen`, port 9000, and the `username` and `password` from the config.
 
-**一台海康对应一个 IP**：NVR 按 IP 区分摄像头。Linux 上可以给代理主机加别名 IP（`ip addr add 192.168.1.201/24 dev eth0`），或用 Docker macvlan；Windows 的做法见下文。
+**One IP per Hikvision camera:** The NVR tells cameras apart by IP. On Linux, add alias IPs to the proxy host (`ip addr add 192.168.1.201/24 dev eth0`) or use Docker macvlan. For Windows, see below.
 
-## 不连 NVR 的本地验证
+## Local testing without an NVR
 
 ```bash
-# 终端 1：假海康（Digest 认证 + alertStream + 抓图），可交互输入事件：vmd human / line 1 vehicle / field 2 human
+# Terminal 1: fake Hikvision (Digest auth + alertStream + snapshot); type events: vmd human / line 1 vehicle / field 2 human
 python tools/fake_hik.py --port 8080
-# 终端 2：代理（hik.host 填 127.0.0.1:8080，main_rtsp 可以是本地 mp4 文件）
+# Terminal 2: the proxy (hik.host = 127.0.0.1:8080; main_rtsp can be a local mp4 file)
 python -m bcproxy -c config.yaml -v
-# 终端 3：Baichuan 客户端，订阅告警并打印 msg 33
+# Terminal 3: Baichuan client, subscribes to alerts and prints msg 33
 python tools/bc_client.py 127.0.0.1 -p change-me --get 199 527 --alarms --seconds 60
 python tools/bc_client.py 127.0.0.1 -p change-me --preview subStream --out sub.h264 --snap a.jpg
 ```
 
-大华用 `python tools/fake_dahua.py --port 8081`（账号 `admin` / `dahua12345`），可输入 `motion`、`human`、`human off`、`line 1 Human`、`region 2 Vehicle`、`blind`。
+For Dahua, use `python tools/fake_dahua.py --port 8081` (account `admin` / `dahua12345`). It accepts `motion`, `human`, `human off`, `line 1 Human`, `region 2 Vehicle` and `blind`.
 
-## 兼容性状态
+## Compatibility status
 
-在真实 Reolink NVR 和 Reolink 手机 App 上测试过（海康 2688×1520 H.265 主码流 + 640×360 子码流）：
+Tested on a real Reolink NVR and the Reolink mobile app (Hikvision 2688×1520 H.265 main stream + 640×360 sub stream):
 
-| 功能 | 状态 | 说明 |
+| Feature | Status | Notes |
 |---|---|---|
-| 手动添加 / 登录 | ✅ 已验证 | FULL_AES（0x12）加密，回显 NVR 的包头 magic `0x0FEDCBA0` |
-| 实时预览（主 / 子码流） | ✅ 已验证 | NVR 和 App 都能看 |
-| 摄像头改名 | ✅ 已验证 | 保存到 `state_dir`，并同步修改海康通道名称（`hik.sync_name`） |
-| AI / 智能侦测事件 | 🟡 代码完成 | msg 31/33；还需要在 NVR 上确认录像触发和图标显示 |
-| 码流设置页（56 / 146） | 🟡 待验证 | v7 补了 `videoEncType`，码率改为读取海康的实际配置 |
-| 码率 / CPU 占用 | 🟡 待 NVR 确认 | 122 回复 `<PerformanceInfo>`（`cpuUseRate`、`codeRate`、`netDataRate`），消息号和字段来自 Reolink Client 的 SDK；大华拿不到 CPU，显示 0 |
-| App 设置页 | 🟡 待验证 | 37 端口、42 邮件、46 移动侦测、52 隐私遮挡、76 网络、112 码流、120 在线用户、132 图像，格式按真机抓包 |
-| 码流分辨率 | 🟡 待 App 验证 | 146 列出海康提供的全部主码流分辨率（子码流和真机一样不可选）；57 写入后改海康的分辨率、帧率、码率并重连视频。App 发的 `videoEncType`、`encoderType` 不可信，不处理 |
-| 录像设置页 | 🟡 待 App 验证 | 81/82 ↔ 海康录像计划（Normal=CMR，其余类型=EDR），54/55 ↔ 覆盖、预录、延录 |
-| 高级网络设置页 | 🟡 待 App 验证 | 40/97/210/455，只保存在代理，不改海康网络 |
-| Tamper Alert | 🟡 待 App 验证 | 199 `aitype` 第 25 位声明能力，763/764 读写海康遮挡侦测开关；海康 `shelteralarm` 上报为 `tamper` |
-| 手动灯 | 🟡 待 App 验证 | 288 → 海康 supplementLight，`light_seconds`（默认 30 秒）后恢复原模式，291 推送状态 |
-| 声音 | 🟡 待 App 验证 | 主码流音频转码为 16 kHz AAC，随预览发送（仅预览；海康无喇叭，不支持对讲） |
-| Motion Boxes | ❌ 未实现 | 现有真机抓包中没有相关消息，需要抓开启该功能的真机 |
-| 回放 | 🟡 待验证 | 海康 SD 卡：ISAPI 录像搜索 + RTSP 回放（只播所选的一段，播完停止）→ 102/142/14/15/16/381/382，拖动 383；海康无存储时自动关闭。298 时间轴缩略图未实现 |
-| 局域网自动搜索 | 🟡 代码完成 | UDP 2000，回复格式按真机抓包；已确认 NVR 的搜索包能收到并回复，NVR“添加摄像头”列表中的显示还待确认 |
-| 其他消息 | ❌ 未知 | 110、113、122 等回空 200；257 回 400、789/818 回 405（与真机一致） |
+| Manual add / login | ✅ Verified | FULL_AES (0x12) encryption, echoes the NVR's header magic `0x0FEDCBA0` |
+| Live preview (main/sub) | ✅ Verified | Works on both NVR and app |
+| Renaming a camera | ✅ Verified | Saved to `state_dir` and synced to the Hikvision channel name (`hik.sync_name`) |
+| AI and smart detection events | 🟡 Code done | msg 31/33; recording triggers and icons still to be confirmed on the NVR |
+| Stream settings page (56 / 146) | 🟡 To verify | v7 added `videoEncType`; bitrate now reads Hikvision's actual config |
+| Bitrate / CPU usage | 🟡 To confirm on the NVR | 122 answers `<PerformanceInfo>` (`cpuUseRate`, `codeRate`, `netDataRate`); message id and fields come from Reolink Client's SDK; Dahua has no CPU value and shows 0 |
+| App settings pages | 🟡 To verify | 37 ports, 42 email, 46 motion detection, 52 privacy mask, 76 network, 112 streams, 120 online users, 132 image; formats follow real captures |
+| Stream resolution | 🟡 To verify in the app | 146 lists all main stream resolutions Hikvision offers (the sub stream is fixed, as on real cameras); writing 57 changes Hikvision's resolution, frame rate and bitrate and reconnects the video. The app's `videoEncType` and `encoderType` are unreliable and ignored |
+| Recording settings page | 🟡 To verify in the app | 81/82 ↔ Hikvision's recording schedule (Normal = CMR, other types = EDR), 54/55 ↔ overwrite, pre-record, post-record |
+| Advanced network settings page | 🟡 To verify in the app | 40/97/210/455, only stored in the proxy, Hikvision's network is not changed |
+| Tamper Alert | 🟡 To verify in the app | Bit 25 of `aitype` in 199 declares it, 763/764 read and write Hikvision's tamper detection switch; Hikvision's `shelteralarm` is reported as `tamper` |
+| Manual light | 🟡 To verify in the app | 288 → Hikvision supplementLight, back to the previous mode after `light_seconds` (default 30 s), 291 pushes the state |
+| Audio | 🟡 To verify in the app | Main stream audio is transcoded to 16 kHz AAC and sent with the preview (preview only; Hikvision has no speaker here, so no two-way audio) |
+| Motion Boxes | ❌ Not implemented | No related messages in the existing captures; needs a capture from a real camera with this feature on |
+| Playback | 🟡 To verify | Hikvision SD card: ISAPI recording search + RTSP playback (only the selected clip, stops at its end) → 102/142/14/15/16/381/382, seeking 383; off automatically when Hikvision has no storage. 298 timeline thumbnails are not implemented |
+| LAN discovery | 🟡 Code done | UDP 2000, reply format follows real captures; the NVR's search packets are confirmed received and answered, display in the NVR's "add camera" list still to be confirmed |
+| Other messages | ❌ Unknown | 110, 113, 122 etc. answer an empty 200; 257 answers 400, 789/818 answer 405 (same as a real camera) |
 
-### 性能
+### Performance
 
-实测（2.0 Mbps 主码流）：解析和封装加密约 0.16% 单核，ffmpeg 转发约 2% 单核，音频转码约 1.6% 单核。CPU 不是瓶颈，首帧等待（1.3～2 秒）主要花在 RTSP 和 ffmpeg 分析上。`-fflags nobuffer`、小 `-probesize` 在主码流和回放上出不了画面，不要用。
+Measured (2.0 Mbps main stream): parsing, packaging and encryption about 0.16% of one core, ffmpeg forwarding about 2%, audio transcoding about 1.6%. CPU is not the bottleneck. The wait for the first frame (1.3–2 s) is mostly RTSP and ffmpeg's analysis. `-fflags nobuffer` and a small `-probesize` give no picture on the main stream and in playback, so don't use them.
 
-### ffmpeg 卡死
+### ffmpeg hangs
 
-- **stderr 要一直读：** 不读的话缓冲区写满，ffmpeg 就阻塞在写 stderr 上，不再读摄像头，摄像头随后断开，而进程还活着。Crossroad 子码流会持续报 `non monotonically increasing dts`，用 concat 输入时约 8 分半就卡死，直连输入报得少，卡死得慢。
-- **连接静默时 ffmpeg 不会退出：** 只有连接被关闭才会。所以 `STALL_SECONDS`（20 秒）内没有数据就重启 ffmpeg，并在 `errors.log` 记一条 `no data`。这条经常出现，说明摄像头或网络有问题。
+- **stderr must be read all the time:** Otherwise its buffers fill up and ffmpeg blocks writing to stderr. It stops reading the camera, the camera then disconnects, and the process stays alive. The Crossroad sub stream keeps reporting `non monotonically increasing dts`, and with concat input it hung after about 8.5 minutes. Direct input reports fewer of these and hangs more slowly.
+- **ffmpeg does not exit when a connection goes silent,** only when it closes. So a stream with no data for `STALL_SECONDS` (20 s) gets a new ffmpeg and a `no data` line in `errors.log`. If that line shows up often, there is a problem with the camera or the network.
 
-### TODO：回放拖动
+### TODO: seeking in playback
 
-拖动进度条还有问题（App 上的具体表现待整理）。383 的回复格式是推断的，没有真机样本；真机上拖动时的抓包还没拿到。录像列表为了不超过单条消息上限会合并片段，拖到合并产生的空档会落到下一段真实录像。
+Dragging the progress bar still has problems (the exact behavior in the app is yet to be written down). The reply format of 383 is inferred, with no sample from a real camera, and a capture of seeking on a real camera is still missing. To stay under the size limit of one message, the recording list merges segments, and seeking into a gap this creates lands on the next real recording.
 
-### TODO：Motion Boxes
+### TODO: Motion Boxes
 
-视频帧的扩展区里带框的数据（抓自 NVR 主码流，App 本地绘制，预览请求没有开关字段）：`ff <len16> { 01 0b00 { 01 0800 <u64 时间> } 02 <len16> { 01 0400 "lz4 " 02 <len16> <LZ4 帧> } }`。I 帧前面另有 8 字节时间。解压后是嵌套 TLV（`<u8 类型> <u16 长度> <值>`），网格 640×352（类型 3），每个框是类型 4：`x1 y1 x2 y2 score`（u16），可再带跟踪 ID 和类别。
+The box data in the extension area of video frames (captured from an NVR main stream, drawn locally by the app, with no switch field in the preview request): `ff <len16> { 01 0b00 { 01 0800 <u64 time> } 02 <len16> { 01 0400 "lz4 " 02 <len16> <LZ4 frame> } }`. I frames have another 8 bytes of time in front. Decompressed, it is nested TLV (`<u8 type> <u16 length> <value>`), on a 640×352 grid (type 3). Each box is type 4: `x1 y1 x2 y2 score` (u16), optionally with a tracking ID and class.
 
-还缺实时目标坐标：海康 RTSP 只有视频和音频。海康 App 的回放能显示框，所以数据应该和录像存在一起，下一步从这里查。App 的开关可能由 199 的 `thumbnail`、`ptzControl` 或 `newIspCfg` 第 6、7 位控制，未验证。
+Real-time object coordinates are still missing: Hikvision's RTSP only has video and audio. Playback in Hikvision's app can show boxes, so the data should be stored with the recordings, and that is where to look next. The app's switch may be controlled by `thumbnail`, `ptzControl` or bits 6 and 7 of `newIspCfg` in 199, not verified.
 
-### 协议上踩过的坑
+### Protocol pitfalls
 
-- **同一连接的并发：** 读循环不等请求处理完，否则慢请求期间连 socket 都不读，PTZ 的 `stop` 进不了处理。登录除外：下一条消息的解密依赖它。
-- **回放筛选类型：** 14 的 `<recordType>` 要列出 `crossline,intrusion,loitering`；片段的 `recordType` 保留 `md`，只有 `sched` 在有其他类型时才去掉。199 的 `aitype` 第 0 位是 Motion：Reolink Client 的 SDK 里，`GetSupportMDEvent` 读这一位，`GetSupportPeopleEvent` 读同一字段的第 1 位。
-- **通知里的事件类型：** Tamper 是 `aitype` 第 13 位（第 25 位只对应设置页开关），越界、警戒区和徘徊是 `smartAI` 第 1–3 位。
-- **没有人车识别的摄像头：** `aitype` 不声明人和车、只声明越界和入侵时，NVR 的通知设置页排版会错乱（DS-2CD2347G1-L 真机确认）。所以这种摄像头也配 `ai_types: [people, vehicle]` 和 `targets: [people, vehicle]`，页面上的 Person、Vehicle 选项不会触发；`untargeted_smart_target` 保持不设，越界和入侵不会被当成人上报。
-- **不要声明 `eventTypeVersion`：** 199 带这个字段时，回放筛选会多出 Answered Call、Crying Sound 这类摄像头没有的事件（这些名称是 Reolink 客户端自带的）。去掉后这些事件消失，NVR 的通知设置里越界和入侵仍在（BackDoor 真机确认）。
-- **灯和红外按钮：** 白光灯来自 199 的 `ledCtrl` 和 `lightType`。151 的 `ledState` 是 LED/红外控制，声明它会多出红外按钮，所以不声明。海康的白光灯通常在 `supplementLight`；DS-2CD2347G1-L 没有这个接口（HTTP 403），开关在 `/ISAPI/System/externalDevice` 的 `SupplementLight`。它的 `auto` 模式白天不亮，所以开灯时改成全天 `schedule` 和手动亮度，关灯时写回原配置。
-- **告警推送：** 日志里真实的 NVR 和手机 App 登录后都没有发过 31（订阅），所以 33 推给所有已登录的连接，不等订阅。
+- **Concurrency on one connection:** The read loop does not wait for requests to finish. Otherwise the socket isn't even read during a slow request, and a PTZ `stop` never gets handled. Login is the exception: decrypting the next message depends on it.
+- **Playback filter types:** `<recordType>` of 14 must list `crossline,intrusion,loitering`. A clip's `recordType` keeps `md`, and only `sched` is dropped when other types are present. Bit 0 of `aitype` in 199 is Motion: in Reolink Client's SDK, `GetSupportMDEvent` reads this bit and `GetSupportPeopleEvent` reads bit 1 of the same field.
+- **Event types in notifications:** Tamper is bit 13 of `aitype` (bit 25 only stands for the settings switch). Line crossing, intrusion and loitering are bits 1–3 of `smartAI`.
+- **Cameras without target detection:** When `aitype` declares no people or vehicle but line crossing and intrusion are declared, the layout of the NVR's notification settings page breaks (confirmed on a real DS-2CD2347G1-L). So these cameras also get `ai_types: [people, vehicle]` and `targets: [people, vehicle]`. The Person and Vehicle options on the page never fire. Leave `untargeted_smart_target` unset, so line crossing and intrusion are not reported as a person.
+- **Don't declare `eventTypeVersion`:** With this field in 199, the playback filter lists events the camera doesn't have, such as Answered Call and Crying Sound (these names are built into the Reolink client). Without it those events are gone, and line crossing and intrusion stay in the NVR's notification settings (confirmed on a real camera).
+- **Light and IR buttons:** The white light comes from `ledCtrl` and `lightType` in 199. `ledState` in 151 is the LED/IR control. Declaring it adds an IR button, so it isn't declared. Hikvision's white light is usually at `supplementLight`. DS-2CD2347G1-L doesn't have that endpoint (HTTP 403): its switch is `SupplementLight` in `/ISAPI/System/externalDevice`. Its `auto` mode stays off in daytime, so turning the light on sets an all-day `schedule` and manual brightness, and turning it off writes the previous config back.
+- **Alert push:** In the logs, a real NVR and the mobile app never sent 31 (subscribe) after logging in. So 33 is pushed to every logged-in connection without waiting for a subscription.
+- **Switching files in playback:** A real camera sends `replayStreamInfo` only once. When the next file starts, the last field of the frame header (the file number) changes, `micros` gets a new base, and the I frame carries that file's real time, with no other message (Duo 2 capture). The proxy doesn't switch automatically for now; this is only for the record. To do so, one Hikvision RTSP stream can cross recording gaps seamlessly, with `-use_wallclock_as_timestamps 1` to avoid timestamp errors.
+- **End of a playback clip:** Hikvision's RTSP playback neither sends frames nor disconnects after `endtime`, so the end is detected by timeout.
+- **Size of one message:** The app hangs on messages over about 40 KB (the largest on a real camera is 39488 bytes), so the recording list must stay within this size.
+- **Bitrate mode:** The app's Bitrate Mode doesn't go through 57. It is `encType` in image message 25 (real capture), matching CBR/VBR of Hikvision's two streams.
+- **Capability bits:** The app decides which options to show from the fields of 199, and a missing field doesn't mean unsupported. `binoCfg` must be an explicit 0, or Sync Brightness appears, which only the Duo series has. The bits of `newIspCfg`: 0 day/night, 1 anti-flicker, 2 exposure, 8 brightness, 9 contrast, 10 saturation, 11 hue, 12 sharpness (from reolink_aio). The value here is 5891, declaring only what is connected to Hikvision.
+- **Header magic:** A Reolink NVR uses `0x0FEDCBA0` (`a0 cb ed 0f`), the app and neolink use `0x0ABCDEF0`. A camera must answer with the magic its peer sent. Otherwise the NVR discards the reply and disconnects after about 200 ms, which its UI shows as "connection timeout".
+- **Encryption:** An NVR requests FULL_AES (`0xdc12`) and disconnects at once on a downgrade to AES (0x02). Binary payloads (video, JPEG) are encrypted whole, with `<encryptLen>` in the extension header. Real cameras also send `checkPos/checkValue` and encrypt only the first 1024 bytes. We don't, and the NVR and app decode fine.
+- **LAN discovery:** Every 2 seconds, an NVR broadcasts the 4 bytes `aa aa 00 00` from UDP 3000 to `255.255.255.255:2000`, and Reolink Client searches the same way. A device answers with a fixed 388-byte structure (IP, port, name, MAC, UID; for field offsets see `bcproxy/discovery.py`). The reply **always goes to the peer's UDP 3000**, whatever the source port of the request. The proxy listens on `0.0.0.0:2000` and answers each search with one packet per virtual camera. `tools/bc_discover.py` lists real and virtual cameras on the LAN.
+- **Settings messages:** Settings written by the NVR or app (25/45/57/105/209/297, and pairs of "read N, write N+1") are merged into the matching read replies and saved to `state_dir/<camera>/<id>.xml`. Delete the file to restore the default.
 
-- **回放切换文件**：真机只发一次 `replayStreamInfo`，下一个文件开始时帧头最后一个字段（文件编号）变化，`micros` 换新基准，I 帧带该文件的真实时间，没有其他消息（Duo 2 抓包）。代理目前不做自动切换，这里只作记录。若要做，海康的一条 RTSP 流能无缝跨过录像空档，需加 `-use_wallclock_as_timestamps 1` 避免时间戳报错。
-- **回放片段结束**：海康的 RTSP 回放到 `endtime` 后既不发帧也不断开，要靠超时判断结束。
-- **单条消息大小**：App 收到超过约 40 KB 的消息会卡住（真机单条最大 39488 字节），所以录像列表要控制在这个大小以内。
-- **码率模式**：App 的 Bitrate Mode 不走 57，而是图像消息 25 里的 `encType`（真机抓包），对应海康两路码流的 CBR/VBR。
-- **能力位**：App 按 199 的字段决定显示哪些选项，字段缺失不等于不支持。`binoCfg` 要明确写 0，否则会出现 Duo 系列才有的 Sync Brightness。`newIspCfg` 各位含义：0 日夜、1 防闪烁、2 曝光、8 亮度、9 对比度、10 饱和度、11 色调、12 锐度（来自 reolink_aio）。这里用 5891，只声明已接到海康的项。
-- **包头 magic**：Reolink NVR 用 `0x0FEDCBA0`（`a0 cb ed 0f`），App 和 neolink 用 `0x0ABCDEF0`。摄像头必须用对端发来的那个 magic 回复，否则 NVR 会丢掉回复，约 200 ms 后断开，界面上显示为“连接超时”。
-- **加密**：NVR 请求 FULL_AES（`0xdc12`），降级到 AES（0x02）会被直接断开。二进制载荷（视频、JPEG）整段加密，扩展头里带 `<encryptLen>`。真机还会带 `checkPos/checkValue`，并且只加密前 1024 字节；我们不这么做，NVR 和 App 也能正常解码。
-- **局域网搜索**：NVR 每 2 秒从 UDP 3000 向 `255.255.255.255:2000` 广播 4 字节 `aa aa 00 00`，Reolink Client 也这样搜索。设备回复一个 388 字节的定长结构（IP、端口、名称、MAC、UID，字段偏移见 `bcproxy/discovery.py`）。回复**固定发到对方的 UDP 3000**，与请求的源端口无关。代理在 `0.0.0.0:2000` 上监听，每收到一次搜索，就为每台虚拟摄像头各回一个包。`tools/bc_discover.py` 可以列出局域网里的真机和虚拟摄像头。
-- **设置消息**：NVR/App 写入的设置（25/45/57/105/209/297，以及“读 N、写 N+1”这种配对）会合并到对应的读取回复里，保存到 `state_dir/<camera>/<id>.xml`，删掉文件即可恢复默认。
+## Running on Windows
 
-## Windows 上运行
-
-- `listen` 中的 IP 必须是本机网卡上已有的地址。要加别名 IP，网卡需要先改成静态 IP，再执行
-  `netsh interface ipv4 add address "以太网" 192.168.0.201 255.255.255.0`。
-- 9000 端口可能被 Hyper-V / WSL / Docker 保留（绑定报 `could not bind`）。用 `netsh interface ipv4 show excludedportrange protocol=tcp` 检查；如果被保留，就先 `net stop winnat`，再执行 `netsh int ipv4 add excludedportrange protocol=tcp startport=9000 numberofports=1`，最后 `net start winnat`。
-- 防火墙放行入站 TCP 9000 和 UDP 2000（局域网搜索）：
+- The IP in `listen` must already exist on a local network adapter. To add an alias IP, first switch the adapter to a static IP, then run
+  `netsh interface ipv4 add address "Ethernet" 192.168.0.201 255.255.255.0`.
+- Port 9000 may be reserved by Hyper-V, WSL or Docker (binding fails with `could not bind`). Check with `netsh interface ipv4 show excludedportrange protocol=tcp`. If it is reserved, run `net stop winnat`, then `netsh int ipv4 add excludedportrange protocol=tcp startport=9000 numberofports=1`, and finally `net start winnat`.
+- Allow inbound TCP 9000 and UDP 2000 (LAN discovery) through the firewall:
   `New-NetFirewallRule -DisplayName "bcproxy 9000" -Direction Inbound -Protocol TCP -LocalPort 9000 -Action Allow`
   `New-NetFirewallRule -DisplayName "bcproxy search" -Direction Inbound -Protocol UDP -LocalPort 2000 -Action Allow`
-- 本机运行 Reolink Client 时，它会占用 UDP 3000，此时 `tools/bc_discover.py` 无法运行（代理本身不受影响）。
-- 保存完整日志：`python -m bcproxy -c config.yaml -v *> log.txt`
+- While Reolink Client runs on the same machine, it holds UDP 3000, and `tools/bc_discover.py` cannot run (the proxy itself is not affected).
+- To save the full log: `python -m bcproxy -c config.yaml -v *> log.txt`
 
-## 部署到 UniFi Cloud Key Gen2 Plus
+## Deploying to a UniFi Cloud Key Gen2 Plus
 
-在 UCK-G2-Plus（UniFi OS 6.0.11，Debian 13，aarch64）上验证。全部文件都在 `/data/bcproxy`，开机由 systemd 启动。首次安装（Git Bash，在 `~/.ssh/config` 里配好 `UCK-G2-Plus`）：
+Verified on a UCK-G2-Plus (UniFi OS 6.0.11, Debian 13, aarch64). All files live in `/data/bcproxy`, and systemd starts the service at boot. First install (Git Bash, with `UCK-G2-Plus` set up in `~/.ssh/config`):
 
 ```bash
-deploy/push.sh --with-config      # 复制代码、config.yaml、state/，下载 Python 和 ffmpeg，启动服务
-deploy/push.sh                    # 以后更新代码：不动设备上的配置和 state/
+deploy/push.sh --with-config      # copies code, config.yaml and state/, downloads Python and ffmpeg, starts the service
+deploy/push.sh                    # later code updates: leaves the device's config and state/ alone
 ```
 
-**每台摄像头一个 IP：** NVR 不支持同一 IP 的不同端口。`config.yaml` 里写 `alias_interface: eth0`，并给每台摄像头配 `listen: 192.168.0.5x:9000`，代理启动时把这些 IP 加到网卡上，运行中每 30 秒检查一次，丢失就补回并写入 `errors.log`。不改 `/etc/systemd/network/eth0.network`，这个文件由 UniFi OS 生成。这些 IP 要避开路由器的 DHCP 地址池。NVR 添加摄像头时填对应的 IP，端口 9000。
+**One IP per camera:** An NVR does not accept different ports on one IP. Put `alias_interface: eth0` in `config.yaml` and give each camera `listen: 192.168.0.5x:9000`. The proxy adds these IPs to the interface at startup, checks them every 30 seconds while running, and adds back any that are lost, with a line in `errors.log`. `/etc/systemd/network/eth0.network` is not changed, because UniFi OS generates that file. Keep these IPs out of the router's DHCP pool. When adding a camera to the NVR, use its IP and port 9000.
 
-**日志**（`/data/bcproxy/logs/`，自动轮转，每种最多 6 个 5 MB 的文件）：
+**Logs** (`/data/bcproxy/logs/`, rotated, at most 6 files of 5 MB each):
 
-| 文件 | 内容 |
+| File | Content |
 |---|---|
-| `errors.log` | WARNING 及以上，排查问题先看这里 |
-| `bcproxy.log` | 全部日志，级别由 `log_level` 决定 |
-| `crash.log` | 致命信号时的 Python 调用栈，含看门狗杀进程时卡住的位置 |
-| `restarts.log` | 每次退出的原因：`result=watchdog`、`oom-kill`、`exit-code` 等 |
+| `errors.log` | WARNING and up; look here first |
+| `bcproxy.log` | Everything, at the level set by `log_level` |
+| `crash.log` | Python stacks from a fatal signal, including where a process killed by the watchdog was stuck |
+| `restarts.log` | The reason for each exit: `result=watchdog`, `oom-kill`, `exit-code` and so on |
 
-RTSP 地址和 XML 里的密码写入前会替换成 `***`。
+Passwords in RTSP URLs and XML are replaced with `***` before writing.
 
-**诊断上传：** UniFi OS 每小时把 `/persistent/report/` 里的报告传给 Ubiquiti，设备上任何进程崩溃时生成的报告都带完整的 `ps`。所以 ffmpeg 的 RTSP 地址（含密码）不放在命令行，而是放进 memfd 里的 ffconcat 文件。`LimitCORE=1` 让代理自己崩溃时不生成报告（0 不行，内核对管道型 `core_pattern` 不看 0）。
+**Diagnostics upload:** UniFi OS uploads the reports in `/persistent/report/` to Ubiquiti every hour, and the report from any process crashing on the device includes the full `ps` output. So ffmpeg's RTSP URL (with its password) is not on the command line, but in an ffconcat file in a memfd. `LimitCORE=1` keeps the proxy's own crashes from creating reports (0 won't do: the kernel ignores 0 for a piped `core_pattern`).
 
-常用命令：
+Useful commands:
 
 ```bash
 systemctl status bcproxy
@@ -219,72 +220,72 @@ tail -f /data/bcproxy/logs/errors.log
 journalctl -u bcproxy -b
 ```
 
-**看门狗：** `Type=notify` + `WatchdogSec=60`。心跳在事件循环里发送，循环卡住 60 秒，或摄像头的后台任务（事件流等）异常退出，服务都会被重启。任何原因退出都在 10 秒后重启，且不限次数。
+**Watchdog:** `Type=notify` + `WatchdogSec=60`. The heartbeat is sent from the event loop, so the service restarts when the loop hangs for 60 seconds or when a camera's background task (such as its event stream) dies. Whatever the reason for an exit, the service restarts after 10 seconds, with no limit on restarts.
 
-**固件升级：** 升级时 `overlay_cleanup`（`/usr/share/initramfs-tools/scripts/ubnt-init/apq8053/boot-emmc`）会删除 `/usr`、`/lib`、`/var`（`var/log` 除外）和部分 `/etc`，保留 `/data` 和 `/etc/systemd/system` 里的服务文件。所以这里不用 apt，也不用固件自带的 Python。`ubnt-dpkg-restore` 只恢复官方白名单里的包，打成 deb 没有用。
+**Firmware updates:** An update runs `overlay_cleanup` (`/usr/share/initramfs-tools/scripts/ubnt-init/apq8053/boot-emmc`), which removes `/usr`, `/lib`, `/var` (except `var/log`) and parts of `/etc`, and keeps `/data` and the service files in `/etc/systemd/system`. That is why this doesn't use apt or the firmware's Python. `ubnt-dpkg-restore` only restores packages on the official whitelist, so packaging this as a deb would not help.
 
-这份清单是固件脚本的一部分，以后可能变。升级后检查 `systemctl is-enabled bcproxy`；如果服务没了，运行下面的命令恢复，它不需要联网：
+This list is part of the firmware's script and may change. After an update, check `systemctl is-enabled bcproxy`. If the service is gone, restore it with the following command, which needs no network:
 
 ```bash
 sh /data/bcproxy/app/deploy/install.sh
 ```
 
-**恢复出厂设置会清空 `/data`**，只能重新运行 `deploy/push.sh --with-config`。`config.yaml` 要在 PC 上留一份；设备上的 `state/` 需要时自己备份。
+**A factory reset wipes `/data`**, and then the only way back is to run `deploy/push.sh --with-config` again. Keep a copy of `config.yaml` on the PC, and back up the device's `state/` if you need it.
 
-## 用真机数据补全未适配的消息
+## Filling in missing messages from a real camera
 
-1. 用真 Reolink 摄像头导出回复：
-   `python tools/bc_client.py <真机IP> -p <密码> --dump-templates captured/ --get 26 46 56 76 110 112 113 122 132 146 208`
-   加上 `--nvr-magic` 可以模拟 NVR 的包头。
-2. 或者在 NVR 和真机之间抓包，然后解密：
-   `python tools/bc_dump.py nvr.pcap -p <摄像头密码> --templates captured/`
-   手机 App 不方便抓包时，可以用中继：`python tools/bc_relay.py <真机IP> --listen 0.0.0.0:9001 --out app.pcap`，然后在 App 里用 IP 添加“本机IP:9001”，再用 bc_dump.py 解密 `app.pcap`。
-3. `captured/<id>.xml` 会优先于内置模板使用，型号、UID 等字段可以改成 `${model}`、`${uid}` 这样的占位符。
-4. 代理开启 `trace: true` 时，日志里的 `unhandled msg N` 就是还缺模板的消息。每个连接里同一个 ID 只警告一次。
+1. Export replies from a real Reolink camera:
+   `python tools/bc_client.py <camera IP> -p <password> --dump-templates captured/ --get 26 46 56 76 110 112 113 122 132 146 208`
+   Add `--nvr-magic` to imitate the NVR's header.
+2. Or capture between the NVR and a real camera, then decrypt:
+   `python tools/bc_dump.py nvr.pcap -p <camera password> --templates captured/`
+   When capturing from a mobile app is impractical, use the relay: `python tools/bc_relay.py <camera IP> --listen 0.0.0.0:9001 --out app.pcap`, add "this PC's IP:9001" by IP in the app, then decrypt `app.pcap` with bc_dump.py.
+3. `captured/<id>.xml` takes priority over the built-in templates. Fields such as model and UID can become placeholders like `${model}` and `${uid}`.
+4. With `trace: true`, `unhandled msg N` in the log marks messages that still lack a template. Each ID is warned about once per connection.
 
-## 文件结构
+## Project layout
 
 ```
 bcproxy/
-  crypto.py     BCEncrypt XOR / AES-128-CFB，登录哈希和密钥派生
-  bc.py         Baichuan 帧编解码（头部、magic、扩展 XML、二进制模式、FULL_AES）
-  bcmedia.py    BcMedia 容器（InfoV2 / I 帧 / P 帧 / AAC），Annex-B 访问单元切分
-  session.py    服务端会话：登录协商、模板应答、设置写入、告警订阅(31/33)、预览(3/4)、抓图(109)
-  camera.py     虚拟摄像头：海康事件 → 状态机 → 推送；能力位、改名、海康状态轮询
-  discovery.py  局域网搜索应答（UDP 2000 → 3000）
-  hikcfg.py     写到海康的设置：码流、录像计划、灯光
-  dahua.py      大华：事件流、配置表、SD 卡录像（接口和 hik/hikcfg/HikRecordings 对应）
-  playback.py   回放：录像搜索、事件标签、回放流
-  settings.py   NVR/App 写入设置的合并与持久化
-  events.py     事件状态机 + <AlarmEventList> 生成
-  hik.py        ISAPI：Digest 认证、alertStream、multipart 解析、告警映射、HTTP 推送接收
-  media.py      ffprobe/ffmpeg 拉 RTSP，多观看者共享一个 ffmpeg，码率统计
-  logsetup.py   控制台和轮转日志文件，写入前去掉密码
-  watchdog.py   systemd 就绪通知和看门狗心跳，检查后台任务是否还活着
-  netalias.py   把摄像头的 listen IP 加到网卡上并保持
-  templates/    内置回复模板（可被 templates_dir 覆盖）
-deploy/         Cloud Key 部署：systemd 服务、设备上的安装脚本、PC 上的推送脚本
+  crypto.py     BCEncrypt XOR / AES-128-CFB, login hash and key derivation
+  bc.py         Baichuan frame codec (header, magic, extension XML, binary mode, FULL_AES)
+  bcmedia.py    BcMedia container (InfoV2 / I frame / P frame / AAC), Annex-B access unit splitting
+  session.py    Server session: login negotiation, template replies, settings writes, alert subscription (31/33), preview (3/4), snapshot (109)
+  camera.py     Virtual camera: Hikvision events → state machine → push; capability bits, renaming, Hikvision status polling
+  discovery.py  LAN discovery replies (UDP 2000 → 3000)
+  hikcfg.py     Settings written to Hikvision: streams, recording schedule, light
+  dahua.py      Dahua: event stream, config tables, SD card recordings (same interface as hik/hikcfg/HikRecordings)
+  playback.py   Playback: recording search, event tags, replay stream
+  settings.py   Merging and persisting settings written by the NVR or app
+  events.py     Event state machine + <AlarmEventList> generation
+  hik.py        ISAPI: Digest auth, alertStream, multipart parsing, alert mapping, HTTP push receiver
+  media.py      ffprobe/ffmpeg pulling RTSP, one ffmpeg shared by all viewers, bitrate statistics
+  logsetup.py   Console and rotating log files, passwords removed before writing
+  watchdog.py   systemd readiness notification and watchdog heartbeat, checks that background tasks are alive
+  netalias.py   Adds the cameras' listen IPs to the network interface and keeps them there
+  templates/    Built-in reply templates (can be overridden by templates_dir)
+deploy/         Cloud Key deployment: systemd service, install script for the device, push script for the PC
 tools/
-  bc_client.py  Baichuan 客户端（测试代理 / 从真机导出模板）
-  bc_dump.py    pcap/pcapng 解密工具
-  bc_discover.py 局域网搜索（列出真机和虚拟摄像头）
-  bc_relay.py   App/NVR 与真机之间的录制中继（输出 pcap，交给 bc_dump.py 解密）
-  fake_hik.py   假海康 ISAPI 服务
-  fake_dahua.py 假大华 CGI 服务（含 PTZ）
-tests/          协议测试（使用 neolink 的真机样本）+ 端到端测试：python -m pytest
+  bc_client.py  Baichuan client (tests the proxy / exports templates from a real camera)
+  bc_dump.py    pcap/pcapng decryption tool
+  bc_discover.py LAN search (lists real and virtual cameras)
+  bc_relay.py   Recording relay between app/NVR and a real camera (writes a pcap for bc_dump.py)
+  fake_hik.py   Fake Hikvision ISAPI service
+  fake_dahua.py Fake Dahua CGI service (with PTZ)
+tests/          Protocol tests (using real camera samples from neolink) + end-to-end tests: python -m pytest
 ```
 
-## 其他限制
+## Other limitations
 
-- 未实现：对讲、海康 PTZ、Motion Boxes、UDP/P2P 连接。回放只回放视频（无音频），播放速度固定 1 倍。
-- 图像页（25/26/132）读写海康：亮度、对比度、饱和度、锐度、镜像翻转、电源频率、日夜模式、白平衡、3D 降噪。曝光、增益、背光、色调没有对接，保存后不生效。
-- 服务器设置（37/38）读写海康：HTTPS、ONVIF 可改；禁用海康 HTTP/RTSP 或改它们的端口会被拒绝，因为代理依赖它们。
-- 只保存在代理、不会写到海康的设置：移动侦测（47）、OSD、网络类页面（DHCP、DDNS、UPnP）。
-- 回放的人/车/智能类型来自代理运行期间收到的告警（`state/<camera>/events.jsonl`）；海康录像索引本身不区分，所以更早的录像只显示移动。
-- 时间戳使用代理收到帧的时间，不是摄像头 PTS。
-- 智能侦测区域的几何信息（线、多边形坐标）没有模拟。如果 NVR 需要显示或编辑区域，请使用真机抓到的 527/529/531 模板。
-- 26（图像参数）和 208（LED/红外灯）用的是参考 reolink_aio 写的默认模板，数值是固定的。
+- Not implemented: two-way audio, Hikvision PTZ, Motion Boxes, UDP/P2P connections. Playback is video only (no audio), at a fixed 1× speed.
+- The image page (25/26/132) reads and writes Hikvision: brightness, contrast, saturation, sharpness, mirror and flip, power frequency, day/night mode, white balance, 3D noise reduction. Exposure, gain, backlight and hue are not connected, and saving them has no effect.
+- Server settings (37/38) read and write Hikvision: HTTPS and ONVIF can be changed. Disabling Hikvision's HTTP or RTSP or changing their ports is refused, because the proxy depends on them.
+- Settings only stored in the proxy and never written to Hikvision: motion detection (47), OSD, network pages (DHCP, DDNS, UPnP).
+- People, vehicle and smart types in playback come from alerts received while the proxy was running (`state/<camera>/events.jsonl`). Hikvision's recording index doesn't distinguish them, so older recordings show only motion.
+- Timestamps are the time the proxy received a frame, not the camera's PTS.
+- The geometry of smart detection zones (line and polygon coordinates) is not emulated. If the NVR needs to show or edit zones, use 527/529/531 templates captured from a real camera.
+- 26 (image parameters) and 208 (LED/IR light) use default templates written with reference to reolink_aio, with fixed values.
 
-## 致谢
+## Credits
 
-协议细节参考了 [neolink](https://github.com/QuantumEntangledAndy/neolink) 和 [reolink_aio](https://github.com/starkillerOG/reolink_aio)，`tests/samples/` 中的真机样本来自 neolink。
+Protocol details draw on [neolink](https://github.com/QuantumEntangledAndy/neolink) and [reolink_aio](https://github.com/starkillerOG/reolink_aio). The real camera samples in `tests/samples/` come from neolink.
