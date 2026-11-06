@@ -530,9 +530,8 @@ class BcSession:
             log.warning("%s: %s unavailable: %s", self.tag, stype, e)
             await self.send(req.reply(400))
             return
-        can_ask = bool(self.cam.hikcfg and self.cam.hikcfg.can_request_keyframe)
         q = src.subscribe()
-        if can_ask:
+        if self.cam.hikcfg:
             self._spawn(self.cam.request_keyframe(stype))
         log.info("%s: preview %s started", self.tag, stype)
         frames = sent = 0

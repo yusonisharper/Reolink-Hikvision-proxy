@@ -216,7 +216,7 @@ class _Spawned:
             self.calls.append((args, kwargs))
             fds = kwargs.get("pass_fds", ())
             self.content = os.pread(fds[0], 4096, 0).decode() if fds else None
-            return SimpleNamespace()
+            return SimpleNamespace(stderr=None)
         monkeypatch.setattr(asyncio, "create_subprocess_exec", fake)
 
 
@@ -462,6 +462,10 @@ def _silent_stream_test(monkeypatch, make_source, first_chunks, later_chunks):
         started.append(plan.pop(0) if plan else _FakeFfmpeg([], silent=False))
         return started[-1]
     monkeypatch.setattr(media, "_spawn", spawn)
+
+    async def no_camera(*a, **kw):
+        raise OSError("no camera in this test")
+    monkeypatch.setattr(media, "probe", no_camera)
     real_sleep = asyncio.sleep
 
     async def quick(t):
@@ -560,3 +564,130 @@ def test_zero_bytes_inside_a_nal_unit_stay():
     idr = b"\x26\x01\xaf\x00\x00\x03\x00\x11\x80"
     aus = list(AnnexBParser("H265").feed(sc + idr + sc + b"\x02\x01\xd0\x33" + sc + b"\x02\x01\xd0\x44"))
     assert aus[0].data == sc + idr
+
+
+def _reconnect_after_probe(monkeypatch, probed):
+    """A stream whose ffmpeg exits once. Returns the output formats it was started with, and the source."""
+    from bcproxy import media
+    formats = []
+
+    async def spawn(tool, head, url, tail, **kw):
+        formats.append(tail[tail.index("-f") + 1])
+        return _FakeFfmpeg([], silent=False)
+
+    async def probe(url, ffprobe="ffprobe", timeout=15):
+        if isinstance(probed, Exception):
+            raise probed
+        return probed
+    monkeypatch.setattr(media, "_spawn", spawn)
+    monkeypatch.setattr(media, "probe", probe)
+    real_sleep = asyncio.sleep
+
+    async def quick(t):
+        await real_sleep(min(t, 0.001))
+    monkeypatch.setattr(media.asyncio, "sleep", quick)
+
+    async def run():
+        src = media.StreamSource("cam/main", "rtsp://h/101", media.StreamInfo("H265", 2688, 1520, 30), linger=0)
+        q = src.subscribe()
+        for _ in range(200):
+            if len(formats) >= 2:
+                break
+            await real_sleep(0.002)
+        src.unsubscribe(q)
+        src._task.cancel()
+        await asyncio.gather(src._task, return_exceptions=True)
+        return src
+    return formats, asyncio.run(run())
+
+
+def test_codec_changed_on_the_camera_is_picked_up(monkeypatch, caplog):
+    """Seen on a real camera: set to H.264 on its web page, ffmpeg kept failing with the old format until a restart."""
+    from bcproxy.media import StreamInfo
+    new = StreamInfo("H264", 2688, 1520, 30)
+    formats, src = _reconnect_after_probe(monkeypatch, new)
+    assert formats[:2] == ["hevc", "h264"]
+    assert src.info is new
+    assert "cam/main: stream changed" in caplog.text
+
+
+def test_same_stream_keeps_its_info_after_a_reconnect(monkeypatch):
+    """Keeps the frame rate from the camera: ffprobe's can be wrong."""
+    from bcproxy.media import StreamInfo
+    formats, src = _reconnect_after_probe(monkeypatch, StreamInfo("H265", 2688, 1520, 60))
+    assert formats[:2] == ["hevc", "hevc"] and src.info.fps == 30
+
+
+def test_failed_probe_keeps_the_stream_going(monkeypatch):
+    formats, src = _reconnect_after_probe(monkeypatch, OSError("camera is rebooting"))
+    assert formats[:2] == ["hevc", "hevc"] and src.info.codec == "H265"
+
+
+def _key_source(monkeypatch):
+    from bcproxy import media
+    started = []
+
+    async def spawn(tool, head, url, tail, **kw):
+        started.append(tail)
+        return _FakeFfmpeg([], silent=False)
+    monkeypatch.setattr(media, "_spawn", spawn)
+    return media.StreamSource("cam/main", "rtsp://h/101", media.StreamInfo("H265", 2560, 1440, 30)), started
+
+
+def test_a_short_session_asks_for_a_keyframe(monkeypatch):
+    """Dahua has no call for a keyframe, and Smart Codec spaces them 25 s apart. A new RTSP session makes its
+    encoder send one to the sessions already running (measured: 0.3 s later)."""
+    src, started = _key_source(monkeypatch)
+    asyncio.run(src.request_keyframe())
+    assert len(started) == 1 and "-frames:v" in started[0] and started[0][started[0].index("-frames:v") + 1] == "1"
+
+
+def test_keyframe_requests_are_rate_limited(monkeypatch):
+    src, started = _key_source(monkeypatch)
+
+    async def run():
+        await asyncio.gather(src.request_keyframe(), src.request_keyframe())
+        await src.request_keyframe()
+    asyncio.run(run())
+    assert len(started) == 1
+
+
+def test_failing_keyframe_request_does_not_raise(monkeypatch):
+    from bcproxy import media
+    src, _ = _key_source(monkeypatch)
+
+    async def broken(*a, **kw):
+        raise OSError("no ffmpeg")
+    monkeypatch.setattr(media, "_spawn", broken)
+    asyncio.run(src.request_keyframe())
+
+
+def _camera_for_keyframes(can_ask):
+    from bcproxy.camera import VirtualCamera
+    cam = VirtualCamera.__new__(VirtualCamera)
+    cam.cfg = SimpleNamespace(name="t")
+    calls = []
+
+    async def ask(idx):
+        calls.append(("isapi", idx))
+
+    def source(name):
+        async def poke():
+            calls.append(("rtsp", name))
+        return SimpleNamespace(request_keyframe=poke)
+    cam.hikcfg = SimpleNamespace(can_request_keyframe=can_ask, request_keyframe=ask)
+    cam.main, cam.sub = source("main"), source("sub")
+    return cam, calls
+
+
+def test_camera_without_a_keyframe_call_uses_a_short_session():
+    cam, calls = _camera_for_keyframes(False)
+    asyncio.run(cam.request_keyframe("mainStream"))
+    asyncio.run(cam.request_keyframe("subStream"))
+    assert calls == [("rtsp", "main"), ("rtsp", "sub")]
+
+
+def test_camera_with_a_keyframe_call_keeps_using_it():
+    cam, calls = _camera_for_keyframes(True)
+    asyncio.run(cam.request_keyframe("subStream"))
+    assert calls == [("isapi", 2)]

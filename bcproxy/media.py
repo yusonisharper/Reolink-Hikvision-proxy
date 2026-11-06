@@ -17,6 +17,7 @@ log = logging.getLogger("media")
 # stayed dead for hours with its ffmpeg still running. Longer than the time to connect and get a frame.
 STALL_SECONDS = 20.0
 STDERR_KEEP = 400    # bytes, for the log line when ffmpeg exits
+KEYFRAME_REQUEST_EVERY = 5.0   # seconds between short sessions that ask for a keyframe
 
 
 @dataclass
@@ -73,7 +74,7 @@ async def _spawn(tool: str, head: list[str], url: str, tail: list[str], *, rtsp:
     finally:
         if fd is not None:
             os.close(fd)
-    if not keep_stderr:
+    if not keep_stderr and proc.stderr:
         proc.stderr_tail = bytearray()
         proc.stderr_task = asyncio.create_task(_drain_stderr(proc))
     return proc
@@ -283,6 +284,7 @@ class StreamSource:
     def __init__(self, name: str, url: str, info: StreamInfo | None = None,
                  ffmpeg: str = "ffmpeg", ffprobe: str = "ffprobe", linger: float = 10.0) -> None:
         self.name, self.url = name, url
+        self._key_asked = float("-inf")
         self.info = info
         self.ffmpeg, self.ffprobe = ffmpeg, ffprobe
         self.linger = linger
@@ -299,7 +301,7 @@ class StreamSource:
         return self.info
 
     def subscribe(self) -> asyncio.Queue:
-        """A late joiner starts at the next keyframe. The last keyframe would show sooner, but the frames
+        """A late joiner starts at the next keyframe; ask for one with request_keyframe. The last keyframe would show sooner, but the frames
         after it refer to frames this viewer never got, and a decoder shows that as a broken picture."""
         q: asyncio.Queue = asyncio.Queue(maxsize=300)
         self.subs.add(q)
@@ -328,10 +330,43 @@ class StreamSource:
             self._task.cancel()
             self._task = asyncio.create_task(self._run(), name=f"ffmpeg-{self.name}") if self.subs else None
 
+    async def request_keyframe(self) -> None:
+        """For a camera with no call for this: a new RTSP session makes Dahua's encoder send a keyframe to the
+        sessions already running too (measured: 0.3 s later). Without it, Smart Codec means up to 25 s of
+        waiting, and an NVR gives up on the stream long before that."""
+        now = time.monotonic()
+        if now - self._key_asked < KEYFRAME_REQUEST_EVERY:
+            return
+        self._key_asked = now
+        proc = None
+        try:
+            proc = await _spawn(self.ffmpeg, ["-hide_banner", "-loglevel", "error"], self.url,
+                                ["-map", "0:v:0", "-c:v", "copy", "-frames:v", "1", "-f", "null", "-"])
+            await asyncio.wait_for(proc.wait(), 15)
+        except (OSError, asyncio.TimeoutError) as e:     # the next keyframe just comes by itself
+            log.debug("%s: keyframe request: %s", self.name, e or type(e).__name__)
+            if proc and proc.returncode is None:
+                proc.kill()
+                await proc.wait()
+
+    async def _refreshed_info(self, info: StreamInfo) -> StreamInfo:
+        """Settings changed on the camera's own page reach us only as a dropped connection. The frame rate
+        stays as it is unless the stream changed: ffprobe's can be wrong (see VirtualCamera)."""
+        try:
+            new = await probe(self.url, self.ffprobe)
+        except Exception as e:  # noqa: BLE001 - camera restarting: try again with what we know
+            log.debug("%s: probe failed: %s", self.name, e or type(e).__name__)
+            return info
+        if (new.codec, new.width, new.height) == (info.codec, info.width, info.height):
+            return info
+        log.warning("%s: stream changed to %s %dx%d@%d", self.name, new.codec, new.width, new.height, new.fps)
+        self.info = new
+        return new
+
     async def _run(self) -> None:
         info = await self.ensure_info()
-        fmt = "h264" if info.codec == "H264" else "hevc"
         while self.subs:
+            fmt = "h264" if info.codec == "H264" else "hevc"
             # local file (testing): loop it in real time
             proc = await _spawn(
                 self.ffmpeg, ["-hide_banner", "-loglevel", "error"], self.url,
@@ -365,3 +400,5 @@ class StreamSource:
                     await proc.wait()
             log.warning("%s: ffmpeg exited (%s) %s", self.name, proc.returncode, await _errors(proc))
             await asyncio.sleep(2)
+            if self.subs:
+                info = await self._refreshed_info(info)
