@@ -141,6 +141,11 @@ python tools/bc_client.py 127.0.0.1 -p change-me --preview subStream --out sub.h
 
 实测（2.0 Mbps 主码流）：解析和封装加密约 0.16% 单核，ffmpeg 转发约 2% 单核，音频转码约 1.6% 单核。CPU 不是瓶颈，首帧等待（1.3～2 秒）主要花在 RTSP 和 ffmpeg 分析上。`-fflags nobuffer`、小 `-probesize` 在主码流和回放上出不了画面，不要用。
 
+### ffmpeg 卡死
+
+- **stderr 要一直读：** 不读的话缓冲区写满，ffmpeg 就阻塞在写 stderr 上，不再读摄像头，摄像头随后断开，而进程还活着。Crossroad 子码流会持续报 `non monotonically increasing dts`，用 concat 输入时约 8 分半就卡死，直连输入报得少，卡死得慢。
+- **连接静默时 ffmpeg 不会退出：** 只有连接被关闭才会。所以 `STALL_SECONDS`（20 秒）内没有数据就重启 ffmpeg，并在 `errors.log` 记一条 `no data`。这条经常出现，说明摄像头或网络有问题。
+
 ### TODO：回放拖动
 
 拖动进度条还有问题（App 上的具体表现待整理）。383 的回复格式是推断的，没有真机样本；真机上拖动时的抓包还没拿到。录像列表为了不超过单条消息上限会合并片段，拖到合并产生的空档会落到下一段真实录像。
@@ -156,6 +161,7 @@ python tools/bc_client.py 127.0.0.1 -p change-me --preview subStream --out sub.h
 - **同一连接的并发：** 读循环不等请求处理完，否则慢请求期间连 socket 都不读，PTZ 的 `stop` 进不了处理。登录除外：下一条消息的解密依赖它。
 - **回放筛选类型：** 14 的 `<recordType>` 要列出 `crossline,intrusion,loitering`；片段的 `recordType` 保留 `md`，只有 `sched` 在有其他类型时才去掉。199 的 `aitype` 第 0 位是 Motion：Reolink Client 的 SDK 里，`GetSupportMDEvent` 读这一位，`GetSupportPeopleEvent` 读同一字段的第 1 位。
 - **通知里的事件类型：** Tamper 是 `aitype` 第 13 位（第 25 位只对应设置页开关），越界、警戒区和徘徊是 `smartAI` 第 1–3 位。
+- **没有人车识别的摄像头：** `aitype` 不声明人和车、只声明越界和入侵时，NVR 的通知设置页排版会错乱（DS-2CD2347G1-L 真机确认）。所以这种摄像头也配 `ai_types: [people, vehicle]` 和 `targets: [people, vehicle]`，页面上的 Person、Vehicle 选项不会触发；`untargeted_smart_target` 保持不设，越界和入侵不会被当成人上报。
 - **不要声明 `eventTypeVersion`：** 199 带这个字段时，回放筛选会多出 Answered Call、Crying Sound 这类摄像头没有的事件（这些名称是 Reolink 客户端自带的）。去掉后这些事件消失，NVR 的通知设置里越界和入侵仍在（BackDoor 真机确认）。
 - **灯和红外按钮：** 白光灯来自 199 的 `ledCtrl` 和 `lightType`。151 的 `ledState` 是 LED/红外控制，声明它会多出红外按钮，所以不声明。海康的白光灯通常在 `supplementLight`；DS-2CD2347G1-L 没有这个接口（HTTP 403），开关在 `/ISAPI/System/externalDevice` 的 `SupplementLight`。它的 `auto` 模式白天不亮，所以开灯时改成全天 `schedule` 和手动亮度，关灯时写回原配置。
 - **告警推送：** 日志里真实的 NVR 和手机 App 登录后都没有发过 31（订阅），所以 33 推给所有已登录的连接，不等订阅。
@@ -190,7 +196,7 @@ deploy/push.sh --with-config      # 复制代码、config.yaml、state/，下载
 deploy/push.sh                    # 以后更新代码：不动设备上的配置和 state/
 ```
 
-NVR 添加摄像头时填 Cloud Key 的 IP，端口是 `listen` 里的端口。
+**每台摄像头一个 IP：** NVR 不支持同一 IP 的不同端口。`config.yaml` 里写 `alias_interface: eth0`，并给每台摄像头配 `listen: 192.168.0.5x:9000`，代理启动时把这些 IP 加到网卡上，运行中每 30 秒检查一次，丢失就补回并写入 `errors.log`。不改 `/etc/systemd/network/eth0.network`，这个文件由 UniFi OS 生成。这些 IP 要避开路由器的 DHCP 地址池。NVR 添加摄像头时填对应的 IP，端口 9000。
 
 **日志**（`/data/bcproxy/logs/`，自动轮转，每种最多 6 个 5 MB 的文件）：
 
@@ -255,6 +261,7 @@ bcproxy/
   media.py      ffprobe/ffmpeg 拉 RTSP，多观看者共享一个 ffmpeg，码率统计
   logsetup.py   控制台和轮转日志文件，写入前去掉密码
   watchdog.py   systemd 就绪通知和看门狗心跳，检查后台任务是否还活着
+  netalias.py   把摄像头的 listen IP 加到网卡上并保持
   templates/    内置回复模板（可被 templates_dir 覆盖）
 deploy/         Cloud Key 部署：systemd 服务、设备上的安装脚本、PC 上的推送脚本
 tools/

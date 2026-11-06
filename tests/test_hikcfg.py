@@ -4,7 +4,7 @@ import importlib.util
 import re
 from pathlib import Path
 
-from bcproxy import bc, bcmedia, hikcfg
+from bcproxy import bc, bcmedia, hik, hikcfg
 from bcproxy import playback as pb
 from bcproxy.bc import ext_xml, xml_value
 from bcproxy.bcmedia import AccessUnit, BcMediaReader
@@ -609,20 +609,6 @@ def test_keyframe_request_failing_changes_nothing():
     asyncio.run(cam.request_keyframe("mainStream"))
 
 
-def test_late_joiner_gets_no_old_keyframe_when_it_will_ask_for_a_new_one():
-    from bcproxy.media import StreamSource
-
-    async def run():
-        src = StreamSource("t", "rtsp://h/101", StreamInfo("H265", 640, 360, 15))
-        src._task = asyncio.create_task(asyncio.sleep(5))
-        src.last_key = AccessUnit(b"old", True)
-        new, old = src.subscribe(old_key=False), src.subscribe()
-        src._task.cancel()
-        return new.qsize(), old.qsize()
-
-    assert asyncio.run(run()) == (0, 1)
-
-
 def test_listen_on_all_interfaces_reports_the_local_ip():
     cam, _ = _cam()
     cam.cfg.listen_host, cam.cfg.hik_host = "0.0.0.0", "127.0.0.1"
@@ -755,3 +741,19 @@ def test_scene_change_as_tamper_on_a_camera_without_people_or_vehicle():
     assert snap.smart == (("crossline", 0, None), ("intrusion", 0, None)) and not snap.ai and snap.motion
     assert xml_value(smart_detect_xml("crossline", zones["crossline"]), "aiType") == "none"
     assert xml_value(smart_detect_xml("crossline", [{"zone": 0}]), "aiType") == "people,vehicle"
+
+
+def test_camera_without_target_detection_never_reports_a_person():
+    """DS-2CD2347G1-L declares people and vehicle only because the NVR's notification page breaks
+    without them. Its line crossing and intrusion events have no target and must stay that way."""
+    from bcproxy.events import alarm_event_xml
+    zones = {k: [{"zone": 0, "name": k, "targets": ["people", "vehicle"]}] for k in ("crossline", "intrusion")}
+    cam, _ = _cam(ai_types=["people", "vehicle"], smart_zones=zones)
+    for hik_type in ("linedetection", "fielddetection"):
+        cam.on_alert(hik.HikAlert(hik_type, "active", 1))
+    snap = cam.state.snapshot()
+    assert snap.ai == frozenset() and snap.motion
+    assert {(k, t) for k, _, t in snap.smart} == {("crossline", None), ("intrusion", None)}
+    xml = alarm_event_xml(snap, report_ai=True, report_smart=True)
+    assert "<AItype>none</AItype>" in xml and "<type>crossline</type>" in xml and "<type>intrusion</type>" in xml
+    assert "people" not in xml and "vehicle" not in xml

@@ -6,6 +6,7 @@ hikcfg is a HikConfig or DahuaConfig, recordings a HikRecordings or DahuaRecordi
 from __future__ import annotations
 
 import asyncio
+import dataclasses
 import logging
 import os
 import time
@@ -203,6 +204,7 @@ class VirtualCamera:
             self.audio_on = bool(self.audio) and await self.hikcfg.audio_enabled()
             if self.hikcfg.light_on_mode:
                 self.light_status = await self.hikcfg.light_mode() == self.hikcfg.light_on_mode
+            await self._use_camera_frame_rates()
         except (OSError, asyncio.TimeoutError) as e:
             log.debug("%s: %s capabilities: %s", self.cfg.name, self.vendor_label, e)
             return False
@@ -212,6 +214,16 @@ class VirtualCamera:
                  {k: v.sizes for k, v in self.hikcfg.caps.items()}, "on" if self.audio_on else "off",
                  self.hikcfg.light_on_mode or "none")
         return True
+
+    async def _use_camera_frame_rates(self) -> None:
+        """What ffprobe reads from the stream can be wrong (60 for a Dahua stream at 30), and the frame
+        rate goes to the NVR in every preview."""
+        for idx, src in ((1, self.main), (2, self.sub)):
+            if src and src.info:
+                fps = (await self.hikcfg.stream_state(idx))[3]
+                if fps > 0 and fps != src.info.fps:
+                    log.info("%s: %s runs at %d fps, the stream says %d", self.cfg.name, src.name, fps, src.info.fps)
+                    src.info = dataclasses.replace(src.info, fps=fps)
 
     async def _retry_load_hik(self, interval: float = 30) -> None:
         while not await self._load_hik():

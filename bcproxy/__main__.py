@@ -8,7 +8,7 @@ import os
 import signal
 import sys
 
-from . import discovery, hik, logsetup, watchdog
+from . import discovery, hik, logsetup, netalias, watchdog
 from .camera import VirtualCamera
 from .config import AppConfig, load
 from .session import BcSession
@@ -38,6 +38,13 @@ async def main_async(cfg: AppConfig, trace: bool | None) -> bool:
     """Returns True when a restart is needed."""
     if trace is not None:
         cfg.trace = trace
+    check = None
+    if cfg.alias_interface:
+        iface, hosts = cfg.alias_interface, netalias.listen_addresses(cfg.cameras)
+        await netalias.ensure(iface, hosts, level=logging.INFO)     # before anything binds to them
+
+        async def check():
+            await netalias.ensure(iface, hosts)
     cams = [VirtualCamera(cc, cfg.templates_dir, cfg.unknown_reply, cfg.state_dir) for cc in cfg.cameras]
     servers: list = []
     starting = [asyncio.create_task(start_camera(cam, cfg.trace, servers)) for cam in cams]
@@ -70,7 +77,7 @@ async def main_async(cfg: AppConfig, trace: bool | None) -> bool:
         except NotImplementedError:
             pass
     watchdog.notify("READY=1")
-    restart = await watchdog.supervise(cams, stop)
+    restart = await watchdog.supervise(cams, stop, check=check)
     watchdog.notify("STOPPING=1")
     for t in starting:
         t.cancel()

@@ -531,13 +531,16 @@ class BcSession:
             await self.send(req.reply(400))
             return
         can_ask = bool(self.cam.hikcfg and self.cam.hikcfg.can_request_keyframe)
-        q = src.subscribe(old_key=not can_ask)
+        q = src.subscribe()
         if can_ask:
             self._spawn(self.cam.request_keyframe(stype))
         log.info("%s: preview %s started", self.tag, stype)
         frames = sent = 0
         t_start = time.monotonic()
         audio_task = None
+        # Video and audio share one message number, and the receiver joins its payloads into frames:
+        # an audio frame between the chunks of a video frame corrupts that frame and all that follow it.
+        frame_lock = asyncio.Lock()
         try:
             first = bcmedia.info_v2(info.width, info.height, info.fps)
             await self.send(req.reply(200, ext=ext_xml(binaryData=1), payload=first, binary=True))
@@ -559,12 +562,13 @@ class BcSession:
                 if t0 is None:
                     t0 = ts
                     if self.cam.audio and self.cam.audio_on:
-                        audio_task = self._spawn(self._audio(req))
+                        audio_task = self._spawn(self._audio(req, frame_lock))
                 micros = int((ts - t0) * 1_000_000)
                 frame = (bcmedia.iframe(info.codec, au.data, micros, int(time.time()))
                          if au.keyframe else bcmedia.pframe(info.codec, au.data, micros))
-                for i in range(0, len(frame), MEDIA_CHUNK):
-                    await self.send(req.reply(200, payload=frame[i:i + MEDIA_CHUNK], binary=True))
+                async with frame_lock:
+                    for i in range(0, len(frame), MEDIA_CHUNK):
+                        await self.send(req.reply(200, payload=frame[i:i + MEDIA_CHUNK], binary=True))
                 if frames == 0:
                     log.info("%s: preview %s first keyframe sent after %.1fs (%d bytes)", self.tag,
                              stype, time.monotonic() - t_start, len(frame))
@@ -581,12 +585,14 @@ class BcSession:
             log.info("%s: preview %s stopped after %.1fs: %d frames, %d KB", self.tag, stype,
                      time.monotonic() - t_start, frames, sent // 1024)
 
-    async def _audio(self, req: BcMsg) -> None:
+    async def _audio(self, req: BcMsg, frame_lock: asyncio.Lock) -> None:
         """Microphone frames, interleaved with the video of one preview request."""
         q = self.cam.audio.subscribe()
         try:
             while True:
-                await self.send(req.reply(200, payload=bcmedia.aac(await q.get()), binary=True))
+                frame = bcmedia.aac(await q.get())
+                async with frame_lock:
+                    await self.send(req.reply(200, payload=frame, binary=True))
         except (ConnectionError, OSError):
             pass
         finally:

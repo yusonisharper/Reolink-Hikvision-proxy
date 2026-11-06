@@ -13,6 +13,11 @@ from .bcmedia import AccessUnit, AnnexBParser
 
 log = logging.getLogger("media")
 
+# ffmpeg never notices a connection that goes silent, only one that closes: seen as a stream that
+# stayed dead for hours with its ffmpeg still running. Longer than the time to connect and get a frame.
+STALL_SECONDS = 20.0
+STDERR_KEEP = 400    # bytes, for the log line when ffmpeg exits
+
 
 @dataclass
 class StreamInfo:
@@ -44,8 +49,10 @@ def _secret_fd(url: str, options: dict[str, str]) -> int | None:
 
 
 async def _spawn(tool: str, head: list[str], url: str, tail: list[str], *, rtsp: dict[str, str] | None = None,
-                 file_args: tuple[str, ...] = ()) -> asyncio.subprocess.Process:
-    """Runs ffmpeg or ffprobe on url: `tool *head <input> *tail`."""
+                 file_args: tuple[str, ...] = (), keep_stderr: bool = False) -> asyncio.subprocess.Process:
+    """Runs ffmpeg or ffprobe on url: `tool *head <input> *tail`. Unless keep_stderr, stderr is read all
+    the time and _errors() gives its end: unread, it fills up and blocks ffmpeg, which then stops reading
+    the camera. A camera that makes ffmpeg complain did that within minutes."""
     extra: dict = {}
     fd = None
     if url.startswith("rtsp"):
@@ -60,19 +67,57 @@ async def _spawn(tool: str, head: list[str], url: str, tail: list[str], *, rtsp:
     else:
         source = [*file_args, "-i", url]
     try:
-        return await asyncio.create_subprocess_exec(
+        proc = await asyncio.create_subprocess_exec(
             tool, *head, *source, *tail,
             stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE, **extra)
     finally:
         if fd is not None:
             os.close(fd)
+    if not keep_stderr:
+        proc.stderr_tail = bytearray()
+        proc.stderr_task = asyncio.create_task(_drain_stderr(proc))
+    return proc
+
+
+async def _drain_stderr(proc) -> None:
+    while data := await proc.stderr.read(4096):
+        proc.stderr_tail += data
+        del proc.stderr_tail[:-STDERR_KEEP]
+
+
+async def _errors(proc) -> str:
+    """The end of what ffmpeg wrote to stderr, once it has exited."""
+    task = getattr(proc, "stderr_task", None)
+    if task is None:
+        return ""
+    try:
+        await asyncio.wait_for(task, 2)
+    except (asyncio.TimeoutError, asyncio.CancelledError):   # a child of ffmpeg can hold the pipe open
+        pass
+    return proc.stderr_tail.decode(errors="replace").strip()
+
+
+async def _read_live(name: str, proc, size: int) -> bytes:
+    """Reads from ffmpeg. A silent source counts as ended, and the caller starts a new ffmpeg."""
+    # asyncio.wait, not wait_for: see read_access_units
+    read = asyncio.ensure_future(proc.stdout.read(size))
+    try:
+        done, _ = await asyncio.wait({read}, timeout=STALL_SECONDS)
+    finally:
+        if not read.done():
+            read.cancel()
+    if done:
+        return read.result()
+    log.warning("%s: no data for %.0f s, restarting ffmpeg", name, STALL_SECONDS)
+    proc.kill()
+    return b""
 
 
 async def probe(url: str, ffprobe: str = "ffprobe", timeout: float = 15) -> StreamInfo:
     proc = await _spawn(
         ffprobe, ["-v", "error"], url,
         ["-select_streams", "v:0", "-show_entries", "stream=codec_name,width,height,avg_frame_rate,r_frame_rate",
-         "-of", "json"])
+         "-of", "json"], keep_stderr=True)
     try:
         out, err = await asyncio.wait_for(proc.communicate(), timeout)
     except asyncio.TimeoutError:
@@ -128,8 +173,8 @@ async def read_access_units(url: str, codec: str, ffmpeg: str = "ffmpeg", first_
         if proc.returncode is None:
             proc.kill()
         await proc.wait()
-        if proc.returncode and proc.stderr:
-            err = (await proc.stderr.read()).decode(errors="replace")[-300:].strip()
+        if proc.returncode:
+            err = await _errors(proc)
             if err:
                 log.warning("playback ffmpeg exited (%s): %s", proc.returncode, err)
 
@@ -215,7 +260,7 @@ class AudioSource:
             buf = bytearray()
             try:
                 assert proc.stdout
-                while data := await proc.stdout.read(4096):
+                while data := await _read_live(self.name, proc, 4096):
                     buf += data
                     for frame in split_adts(buf):
                         for q in list(self.subs):
@@ -228,8 +273,7 @@ class AudioSource:
                 if proc.returncode is None:
                     proc.kill()
                     await proc.wait()
-            err = (await proc.stderr.read()).decode(errors="replace")[-300:] if proc.stderr else ""
-            log.warning("%s: ffmpeg exited (%s) %s", self.name, proc.returncode, err.strip())
+            log.warning("%s: ffmpeg exited (%s) %s", self.name, proc.returncode, await _errors(proc))
             await asyncio.sleep(5)
 
 
@@ -245,7 +289,6 @@ class StreamSource:
         self.subs: set[asyncio.Queue] = set()
         self._task: asyncio.Task | None = None
         self._stop_handle: asyncio.TimerHandle | None = None
-        self.last_key: AccessUnit | None = None
         self.rate = RateMeter()
 
     async def ensure_info(self) -> StreamInfo:
@@ -255,9 +298,9 @@ class StreamSource:
                      self.info.height, self.info.fps)
         return self.info
 
-    def subscribe(self, old_key: bool = True) -> asyncio.Queue:
-        """old_key: a late joiner starts from the last keyframe. It shows at once, but the frames after it do
-        not follow from it. A caller that can ask the camera for a new keyframe does better without it."""
+    def subscribe(self) -> asyncio.Queue:
+        """A late joiner starts at the next keyframe. The last keyframe would show sooner, but the frames
+        after it refer to frames this viewer never got, and a decoder shows that as a broken picture."""
         q: asyncio.Queue = asyncio.Queue(maxsize=300)
         self.subs.add(q)
         if self._stop_handle:
@@ -265,8 +308,6 @@ class StreamSource:
             self._stop_handle = None
         if self._task is None or self._task.done():
             self._task = asyncio.create_task(self._run(), name=f"ffmpeg-{self.name}")
-        elif old_key and self.last_key is not None:
-            q.put_nowait((time.monotonic(), self.last_key))
         return q
 
     def unsubscribe(self, q: asyncio.Queue) -> None:
@@ -279,12 +320,10 @@ class StreamSource:
         if not self.subs and self._task:
             self._task.cancel()
             self._task = None
-            self.last_key = None
 
     def reconfigure(self, info: StreamInfo) -> None:
         """The Hikvision stream settings changed: reconnect with the new format."""
         self.info = info
-        self.last_key = None
         if self._task:
             self._task.cancel()
             self._task = asyncio.create_task(self._run(), name=f"ffmpeg-{self.name}") if self.subs else None
@@ -302,17 +341,16 @@ class StreamSource:
             try:
                 assert proc.stdout
                 while True:
-                    data = await proc.stdout.read(65536)
+                    data = await _read_live(self.name, proc, 65536)
                     if not data:
                         break
                     self.rate.add(len(data))
                     for au in parser.feed(data):
-                        if au.keyframe:
-                            self.last_key = au
                         item = (time.monotonic(), au)
                         for q in list(self.subs):
                             if q.full():
                                 # viewer too slow: drop its backlog, resume at next keyframe
+                                log.warning("%s: viewer too slow, dropping %d frames", self.name, q.qsize())
                                 while not q.empty():
                                     q.get_nowait()
                                 q.put_nowait(None)
@@ -325,6 +363,5 @@ class StreamSource:
                 if proc.returncode is None:
                     proc.kill()
                     await proc.wait()
-            err = (await proc.stderr.read()).decode(errors="replace")[-400:] if proc.stderr else ""
-            log.warning("%s: ffmpeg exited (%s) %s", self.name, proc.returncode, err.strip())
+            log.warning("%s: ffmpeg exited (%s) %s", self.name, proc.returncode, await _errors(proc))
             await asyncio.sleep(2)

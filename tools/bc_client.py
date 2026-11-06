@@ -146,7 +146,7 @@ async def amain(a) -> None:
         print(f"preview response {rep.response}")
         q = c.subs[(3, rep.msg_num)]
         reader = bcmedia.BcMediaReader()
-        frames = {"I": 0, "P": 0}
+        frames = {"I": 0, "P": 0, "audio": 0}
         out = open(a.out, "wb") if a.out else None
         end = time.monotonic() + a.seconds
         pending = [rep]
@@ -157,7 +157,7 @@ async def amain(a) -> None:
                     print("info", meta)
                 elif kind in frames:
                     frames[kind] += 1
-                    if out:
+                    if out and kind != "audio":
                         out.write(data)
         print(f"frames: {frames}")
         await c.request(4, ext=ext_xml(channelId=0), payload=body_xml(

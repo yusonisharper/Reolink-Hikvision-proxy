@@ -20,6 +20,10 @@ unknown_reply: ok
 # 默认开启；false 关闭，或写成 192.168.1.200:2000 只在一个网卡上监听。
 # discovery: true
 
+# 可选（Linux，需要 root）：把各摄像头 listen 里的 IP 加到这个网卡上，并在运行中保持。
+# Reolink NVR 不支持同一 IP 的不同端口，所以每台虚拟摄像头要有自己的 IP。
+# alias_interface: eth0
+
 # 可选：海康 "HTTP 监听/报警主机" 推送模式的接收端口（camera.hik.events = listen 时使用）
 # hik_listen: 0.0.0.0:8088
 

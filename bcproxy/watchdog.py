@@ -10,6 +10,7 @@ import asyncio
 import logging
 import os
 import socket
+from typing import Awaitable, Callable
 
 log = logging.getLogger("watchdog")
 
@@ -39,8 +40,10 @@ def interval() -> float | None:
     return usec / 2e6 if usec > 0 else None
 
 
-async def supervise(cams: list, stop: asyncio.Event, period: float = 10.0) -> bool:
-    """Runs until stop is set. True when a camera task died and the service should be restarted."""
+async def supervise(cams: list, stop: asyncio.Event, period: float = 10.0,
+                    check: Callable[[], Awaitable] | None = None) -> bool:
+    """Runs until stop is set, with check on every round. True when a camera task died and the
+    service should be restarted."""
     beat = interval()
     reported: set = set()
     while not stop.is_set():
@@ -53,6 +56,8 @@ async def supervise(cams: list, stop: asyncio.Event, period: float = 10.0) -> bo
                              exc_info=task.exception())
         if reported and beat:       # under a supervisor a restart repairs it
             return True
+        if check:
+            await check()
         if beat:
             notify("WATCHDOG=1")
         try:

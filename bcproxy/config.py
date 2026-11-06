@@ -21,6 +21,7 @@ class AppConfig:
     listen_host: str = "0.0.0.0"
     listen_port: int | None = None    # Hikvision HTTP push receiver
     discovery: tuple[str, int] | None = ("0.0.0.0", 2000)   # Reolink LAN search responder
+    alias_interface: str | None = None   # add the cameras' listen addresses to this interface
     extra: dict = field(default_factory=dict)
 
 
@@ -104,4 +105,5 @@ def load(path: str) -> AppConfig:
         unknown_reply=200 if unknown in ("ok", 200) else 400,
         log_level=raw.get("log_level", "info"), trace=bool(raw.get("trace", False)),
         listen_host=lh or "0.0.0.0", listen_port=lp, discovery=discovery,
+        alias_interface=raw.get("alias_interface"),
     )
