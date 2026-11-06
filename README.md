@@ -50,14 +50,14 @@ Dahua IPC ──eventManager.cgi event stream──────┐
 
 Dahua sends `Start` and `Stop` once each. The proxy repeats the event every second in between, which works the same as Hikvision's continuous alerts, and treats the `Stop` as lost after 10 minutes. Except for plain motion, `Stop` does not clear the state right away: it waits for the `hold` time to end.
 
-**Status:** One real camera (Amcrest `IP4M-1083E-AI`, a rebranded Dahua SD5A432XB-HNR, firmware 2.810, H.265 main stream 2560×1440 at 30 fps, sub stream 640×480 at 15 fps) runs on a real Reolink NVR through the proxy: both streams load and keep running. Reading, preview and PTZ were also verified with `tools/bc_client.py`. An IVS intrusion rule triggered on the camera reaches the proxy as `intrusion`, zone 0, target `people`, with `region_base: 5`. Writing settings has not been verified on a real camera. Plain motion is untested on this camera: Motion Detection has to be off for IVS to be on. The rest was only tested with `tools/fake_dahua.py`, and other models and firmware may differ. When connecting a new model for the first time, run with `-v`, and check that the `RuleId` of events matches `region_base` and that `encode.cgi getConfigCaps` yields resolutions (if it cannot be parsed, only the current resolution is offered).
+**Status:** One real camera (Amcrest `IP4M-1083E-AI`, a rebranded Dahua SD5A432XB-HNR, firmware 2.810, H.265 main stream 2560×1440 at 30 fps, sub stream 640×480 at 15 fps) runs on a real Reolink NVR through the proxy: both streams load and keep running. Reading, preview and PTZ were also verified with `tools/bc_client.py`. An IVS intrusion rule triggered on the camera reaches the proxy as `intrusion`, zone 0, target `people`, with `region_base: 5`, and the NVR sends a notification. Writing settings has not been verified on a real camera. Plain motion is untested on this camera: Motion Detection has to be off for IVS to be on. The rest was only tested with `tools/fake_dahua.py`, and other models and firmware may differ. When connecting a new model for the first time, run with `-v`, and check that the `RuleId` of events matches `region_base` and that `encode.cgi getConfigCaps` yields resolutions (if it cannot be parsed, only the current resolution is offered).
 
 | Feature | Dahua |
 |---|---|
 | Main/sub stream preview | ✅ Verified on a real NVR |
 | Snapshot | ✅ Verified on a real camera (`bc_client`) |
 | Audio | 🟡 AAC frames reach the client (`bc_client`), but this camera's own output is nearly silent (about -91 dB), so nothing audible has been confirmed |
-| IVS intrusion with a person | ✅ Verified on a real camera, as far as the proxy's state and event log (whether the NVR notifies is not confirmed) |
+| IVS intrusion with a person | ✅ Verified on a real camera and NVR, including the NVR's notification |
 | Plain motion, vehicle, line crossing, loitering, tamper | 🟡 Connected, to be verified on a real camera. Motion Detection and IVS cannot be on together on this camera |
 | SD card playback | 🟡 Recording search and capacity read on a real camera; RTSP `/cam/playback` to be verified |
 | Streams (resolution, frame rate, bitrate, CBR/VBR, audio switch) | 🟡 Capabilities and current values read on a real camera; writing `Encode` to be verified |
