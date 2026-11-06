@@ -18,6 +18,7 @@ log = logging.getLogger("media")
 STALL_SECONDS = 20.0
 STDERR_KEEP = 400    # bytes, for the log line when ffmpeg exits
 KEYFRAME_REQUEST_EVERY = 5.0   # seconds between short sessions that ask for a keyframe
+REPROBE_EVERY = 30.0           # seconds between probes caused by a new SPS
 
 
 @dataclass
@@ -285,6 +286,8 @@ class StreamSource:
                  ffmpeg: str = "ffmpeg", ffprobe: str = "ffprobe", linger: float = 10.0) -> None:
         self.name, self.url = name, url
         self._key_asked = float("-inf")
+        self._reprobed = float("-inf")
+        self._reprobe_task: asyncio.Task | None = None
         self.info = info
         self.ffmpeg, self.ffprobe = ffmpeg, ffprobe
         self.linger = linger
@@ -349,6 +352,13 @@ class StreamSource:
                 proc.kill()
                 await proc.wait()
 
+    def _reprobe_soon(self) -> None:
+        """A new SPS on a running connection: rotating the image changes the size without dropping it."""
+        now = time.monotonic()
+        if self.info and now - self._reprobed >= REPROBE_EVERY and not (self._reprobe_task and not self._reprobe_task.done()):
+            self._reprobed = now
+            self._reprobe_task = asyncio.create_task(self._refreshed_info(self.info))
+
     async def _refreshed_info(self, info: StreamInfo) -> StreamInfo:
         """Settings changed on the camera's own page reach us only as a dropped connection. The frame rate
         stays as it is unless the stream changed: ffprobe's can be wrong (see VirtualCamera)."""
@@ -372,6 +382,7 @@ class StreamSource:
                 self.ffmpeg, ["-hide_banner", "-loglevel", "error"], self.url,
                 ["-map", "0:v:0", "-c:v", "copy", "-f", fmt, "pipe:1"], file_args=("-re", "-stream_loop", "-1"))
             parser = AnnexBParser(info.codec)
+            sps_type, sps = (7 if info.codec == "H264" else 33), None
             log.info("%s: ffmpeg started (pid %s)", self.name, proc.pid)
             try:
                 assert proc.stdout
@@ -380,7 +391,13 @@ class StreamSource:
                     if not data:
                         break
                     self.rate.add(len(data))
-                    for au in parser.feed(data):
+                    aus = parser.feed(data)
+                    new_sps = parser.params.get(sps_type)
+                    if new_sps != sps:
+                        if sps is not None:
+                            self._reprobe_soon()
+                        sps = new_sps
+                    for au in aus:
                         item = (time.monotonic(), au)
                         for q in list(self.subs):
                             if q.full():
@@ -401,4 +418,4 @@ class StreamSource:
             log.warning("%s: ffmpeg exited (%s) %s", self.name, proc.returncode, await _errors(proc))
             await asyncio.sleep(2)
             if self.subs:
-                info = await self._refreshed_info(info)
+                info = await self._refreshed_info(self.info or info)

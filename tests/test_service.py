@@ -691,3 +691,79 @@ def test_camera_with_a_keyframe_call_keeps_using_it():
     cam, calls = _camera_for_keyframes(True)
     asyncio.run(cam.request_keyframe("subStream"))
     assert calls == [("isapi", 2)]
+
+
+def _h265_key(sps: bytes) -> bytes:
+    sc = b"\x00\x00\x00\x01"
+    return sc + b"\x40\x01\x0c" + sc + b"\x42\x01" + sps + sc + b"\x44\x01\xc0" + sc + b"\x26\x01\xaf\x11"
+
+
+def _h265_p() -> bytes:
+    return b"\x00\x00\x00\x01\x02\x01\xd0\x33"
+
+
+def _stream_with_chunks(monkeypatch, chunks, probed):
+    from bcproxy import media
+    probes = []
+
+    async def spawn(*a, **kw):
+        return _FakeFfmpeg(chunks)
+
+    async def probe(url, ffprobe="ffprobe", timeout=15):
+        probes.append(url)
+        return probed
+    monkeypatch.setattr(media, "_spawn", spawn)
+    monkeypatch.setattr(media, "probe", probe)
+
+    async def run():
+        src = media.StreamSource("cam/main", "rtsp://h/101", media.StreamInfo("H265", 2688, 1520, 30), linger=0)
+        q = src.subscribe()
+        await asyncio.sleep(0.05)
+        info = src.info
+        src.unsubscribe(q)
+        src._task.cancel()
+        await asyncio.gather(src._task, return_exceptions=True)
+        return info
+    return probes, asyncio.run(run())
+
+
+def test_new_sps_on_a_running_connection_is_noticed(monkeypatch, caplog):
+    """Seen on a real camera: rotating the image changes the size without dropping the RTSP connection."""
+    from bcproxy.media import StreamInfo
+    rotated = StreamInfo("H265", 1520, 2688, 25)
+    chunks = [_h265_key(b"\x01\x01") + _h265_p(), _h265_key(b"\x02\x02") + _h265_p() + _h265_p()]
+    probes, info = _stream_with_chunks(monkeypatch, chunks, rotated)
+    assert probes and info is rotated
+    assert "cam/main: stream changed" in caplog.text
+
+
+def test_same_sps_does_not_probe_again(monkeypatch):
+    from bcproxy.media import StreamInfo
+    chunks = [_h265_key(b"\x01\x01") + _h265_p() + _h265_key(b"\x01\x01") + _h265_p() + _h265_p()]
+    probes, info = _stream_with_chunks(monkeypatch, chunks, StreamInfo("H265", 1520, 2688, 25))
+    assert not probes and info.width == 2688
+
+
+def test_frame_rate_is_checked_on_the_status_poll(monkeypatch):
+    from bcproxy.camera import VirtualCamera
+    from bcproxy.media import StreamInfo
+
+    async def run():
+        cam = VirtualCamera.__new__(VirtualCamera)
+        cam.cfg = SimpleNamespace(name="t")
+        cam.hik_bitrate, cam.hik_sub_bitrate = 1, 1
+        cam.main, cam.sub = SimpleNamespace(name="m", info=StreamInfo("H265", 1520, 2688, 30)), None
+
+        async def cpu():
+            return 5
+
+        async def stream_state(idx):
+            return ("H265", 0, 0, 25, 0)
+        cam.hikcfg = SimpleNamespace(cpu_usage=cpu, stream_state=stream_state)
+        task = asyncio.create_task(cam._poll_status(interval=0.001))
+        await asyncio.sleep(0.1)
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+        return cam.main.info.fps
+
+    assert asyncio.run(run()) == 25

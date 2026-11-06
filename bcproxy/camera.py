@@ -26,6 +26,7 @@ from .templates import Templates
 log = logging.getLogger("camera")
 
 FRAME_RATE_MODE_KEY = 25      # settings store slot (write id of the image page)
+FRAME_RATE_CHECK_ROUNDS = 6   # status polls between checks of the camera's frame rate: one minute
 AITYPE_BITS = {"people": 1 << 1, "vehicle": 1 << 2, "face": 1 << 3, "dog_cat": 1 << 4}
 AITYPE_TAMPER = 1 << 25       # the app's Tamper Alert (reolink_aio: aitype bit 25)
 # The app's Motion filter: libBCSDKWrapper's GetSupportMDEvent tests bit 0 of the field where GetSupportPeopleEvent tests bit 1.
@@ -481,9 +482,13 @@ class VirtualCamera:
     async def _poll_status(self, interval: float = 10) -> None:
         """CPU usage + configured bitrate from the source camera (for NVR "Performance")."""
         warned = False
+        rounds = 0
         while True:
             try:
                 self.hik_cpu = await self.hikcfg.cpu_usage()
+                if rounds % FRAME_RATE_CHECK_ROUNDS == 0:     # changed on the camera's own page, says no SPS
+                    await self._use_camera_frame_rates()
+                rounds += 1
                 if self.hik_bitrate is None:
                     self.hik_bitrate, self.hik_sub_bitrate = await self.hikcfg.bitrates()
                     log.info("%s: %s bitrate main=%s sub=%s kbps", self.cfg.name, self.vendor_label,
