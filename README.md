@@ -50,12 +50,14 @@ Dahua IPC ──eventManager.cgi event stream──────┐
 
 Dahua sends `Start` and `Stop` once each. The proxy repeats the event every second in between, which works the same as Hikvision's continuous alerts, and treats the `Stop` as lost after 10 minutes. Except for plain motion, `Stop` does not clear the state right away: it waits for the `hold` time to end.
 
-**Status:** Reading, preview and PTZ were verified with `tools/bc_client.py` on one real camera (Amcrest `IP4M-1083E-AI`, a rebranded Dahua SD5A432XB-HNR, firmware 2.810, 2560×1440 H.265). It has not been connected to a Reolink NVR or app, and writing settings and people, vehicle and smart events have not been triggered on a real camera. The rest was only tested with `tools/fake_dahua.py`, and other models and firmware may differ. When connecting a new model for the first time, run with `-v`, and check that the `RuleId` of events matches `region_base` and that `encode.cgi getConfigCaps` yields resolutions (if it cannot be parsed, only the current resolution is offered).
+**Status:** One real camera (Amcrest `IP4M-1083E-AI`, a rebranded Dahua SD5A432XB-HNR, firmware 2.810, H.265 main stream 2560×1440 at 30 fps, sub stream 640×480 at 15 fps) runs on a real Reolink NVR through the proxy: both streams load and keep running. Reading, preview and PTZ were also verified with `tools/bc_client.py`. Writing settings has not been verified on a real camera, and no motion, people, vehicle or smart event has been seen from it: the event stream connects, but none arrived during about 3 hours on the NVR, so that path is untested. The rest was only tested with `tools/fake_dahua.py`, and other models and firmware may differ. When connecting a new model for the first time, run with `-v`, and check that the `RuleId` of events matches `region_base` and that `encode.cgi getConfigCaps` yields resolutions (if it cannot be parsed, only the current resolution is offered).
 
 | Feature | Dahua |
 |---|---|
-| Main/sub stream preview, snapshot | ✅ Verified on a real camera (`bc_client`, no NVR or app) |
-| Audio, AI and smart events | 🟡 Connected, to be verified on a real camera (the event stream connects, only `NewFile` seen so far) |
+| Main/sub stream preview | ✅ Verified on a real NVR |
+| Snapshot | ✅ Verified on a real camera (`bc_client`) |
+| Audio | 🟡 AAC frames reach the client (`bc_client`), but this camera's own output is nearly silent (about -91 dB), so nothing audible has been confirmed |
+| Motion, AI and smart events | 🟡 Connected, to be verified on a real camera (the event stream connects, only `NewFile` seen so far) |
 | SD card playback | 🟡 Recording search and capacity read on a real camera; RTSP `/cam/playback` to be verified |
 | Streams (resolution, frame rate, bitrate, CBR/VBR, audio switch) | 🟡 Capabilities and current values read on a real camera; writing `Encode` to be verified |
 | Image page | 🟡 Only brightness, contrast, saturation, sharpness, mirror, flip and day/night; the rest has no effect |
@@ -66,7 +68,14 @@ Dahua sends `Start` and `Stop` once each. The proxy repeats the event every seco
 | Recording schedule and settings (54/55/81/82) | ❌ Not connected and not declared to the app; set them on the Dahua web page |
 | Server ports (37/38), manual light, CPU usage, HTTP push events | ❌ Not connected |
 
-Note: Dahua may lock the account after repeated failed logins, and with a wrong password the proxy's reconnects can trigger that.
+Note: Dahua may lock the account after repeated failed logins, and with a wrong password the proxy's reconnects can trigger that. Right after the proxy starts, a single `Dahua status poll failed ... HTTP 401` sometimes appears (5 of 17 starts) and the next poll succeeds. The cause is probably concurrent requests sharing one digest nonce, not yet confirmed.
+
+Two things the NVR needed:
+
+- **A viewer starts at the next keyframe.** Dahua cannot be asked for a new keyframe, and an old one is followed by frames that refer to frames the viewer never got. On this camera the wait is at most about 1 second.
+- **The frame rate comes from the camera's `Encode` config.** ffprobe reports double the real value here (60 for a 30 fps main stream, 30 for a 15 fps sub stream).
+
+Which of the two made the stream load on the NVR is not known: both were fixed together.
 
 ### PTZ
 
