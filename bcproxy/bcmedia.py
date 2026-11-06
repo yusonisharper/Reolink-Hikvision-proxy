@@ -111,7 +111,9 @@ def _split_nals(buf: bytes) -> tuple[list[bytes], bytes]:
         i = j + 3
     if len(starts) < 2:
         return [], buf
-    nals = [b"\x00\x00\x00\x01" + buf[starts[k][1]:starts[k + 1][0]] for k in range(len(starts) - 1)]
+    # rstrip: trailing_zero_8bits (Dahua pads with them) are not part of a NAL unit. A Reolink NVR plays
+    # them, but the mp4 it makes for a download then has no I frames.
+    nals = [b"\x00\x00\x00\x01" + buf[starts[k][1]:starts[k + 1][0]].rstrip(b"\x00") for k in range(len(starts) - 1)]
     return nals, buf[starts[-1][0]:]
 
 

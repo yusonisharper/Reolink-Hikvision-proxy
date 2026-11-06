@@ -535,3 +535,28 @@ def test_noisy_stderr_does_not_block_ffmpeg():
     out, err = asyncio.run(run())
     assert out == b"done"
     assert err.endswith("the last line") and len(err) <= media.STDERR_KEEP
+
+
+def test_trailing_zeros_between_nal_units_are_dropped():
+    """Dahua pads its NAL units with a zero byte. A Reolink NVR plays that, but its mp4 download then
+    loses every I frame. trailing_zero_8bits are not part of a NAL unit."""
+    from bcproxy.bcmedia import AnnexBParser
+    sc = b"\x00\x00\x00\x01"
+    vps, sps, pps = b"\x40\x01\x0c", b"\x42\x01\x01", b"\x44\x01\xc0"
+    sei = b"\x4e\x01\xe5\x04\x46\x46\x00\x00\x80"
+    idr, p1, p2 = b"\x26\x01\xaf\x11\x22", b"\x02\x01\xd0\x33", b"\x02\x01\xd0\x44"
+    pad = b"\x00"
+    stream = sc + (pad + sc).join([vps, sps, pps, sei, idr]) + sc + p1 + sc + p2 + sc + p1
+    aus = list(AnnexBParser("H265").feed(stream))
+    assert aus[0].keyframe
+    assert aus[0].data == sc + vps + sc + sps + sc + pps + sc + sei + sc + idr
+    assert b"\x00\x00\x00\x00\x01" not in aus[0].data
+    assert aus[1].data == sc + p1
+
+
+def test_zero_bytes_inside_a_nal_unit_stay():
+    from bcproxy.bcmedia import AnnexBParser
+    sc = b"\x00\x00\x00\x01"
+    idr = b"\x26\x01\xaf\x00\x00\x03\x00\x11\x80"
+    aus = list(AnnexBParser("H265").feed(sc + idr + sc + b"\x02\x01\xd0\x33" + sc + b"\x02\x01\xd0\x44"))
+    assert aus[0].data == sc + idr
