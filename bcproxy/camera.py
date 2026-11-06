@@ -30,10 +30,6 @@ AITYPE_TAMPER = 1 << 25       # the app's Tamper Alert (reolink_aio: aitype bit 
 # The app's Motion filter: libBCSDKWrapper's GetSupportMDEvent tests bit 0 of the field where GetSupportPeopleEvent tests bit 1.
 AITYPE_MOTION = 1 << 0
 AITYPE_TAMPER_EVENT = 1 << 13   # notifications: GetSupportTamperEvent. Bit 25 is only the settings switch.
-# Event types the client lists: the bits of its Get...EventLog abilities. That this field is 199's eventTypeVersion
-# is inferred from the names (it also holds GetEventTypeList), not seen on a real camera.
-EVENT_TYPE_BITS = {"md": 1 << 0, "people": 1 << 1, "vehicle": 1 << 2, "dog_cat": 1 << 3, "crossline": 1 << 9,
-                   "intrusion": 1 << 10, "loitering": 1 << 11, "tamper": 1 << 18}
 SMART_BITS = {"crossline": 1 << 1, "intrusion": 1 << 2, "loitering": 1 << 3}
 
 
@@ -513,13 +509,6 @@ class VirtualCamera:
         return bits | (AITYPE_TAMPER | AITYPE_TAMPER_EVENT if self.hikcfg and self.hikcfg.has_tamper else 0)
 
     @property
-    def event_type_bits(self) -> int:
-        kinds = {"md", *self.cfg.ai_types, *(t for t in SMART_TYPES if self.cfg.smart_zones.get(t))}
-        if self.hikcfg and self.hikcfg.has_tamper:
-            kinds.add("tamper")
-        return sum(bit for kind, bit in EVENT_TYPE_BITS.items() if kind in kinds)
-
-    @property
     def smartai_bits(self) -> int:
         return sum(SMART_BITS[t] for t in SMART_TYPES if self.cfg.smart_zones.get(t))
 
@@ -596,7 +585,6 @@ class VirtualCamera:
             "hour": t.tm_hour, "minute": t.tm_min, "second": t.tm_sec,
             "tz_offset": -t.tm_gmtoff,
             "aitype_bits": self.aitype_bits, "smartai_bits": self.smartai_bits,
-            "event_type_bits": self.event_type_bits,
             "detect_types": ",".join(x for x in AI_TYPES if x in self.cfg.ai_types) or "none",
         }
 

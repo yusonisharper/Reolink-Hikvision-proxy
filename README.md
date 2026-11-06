@@ -155,7 +155,8 @@ python tools/bc_client.py 127.0.0.1 -p change-me --preview subStream --out sub.h
 
 - **同一连接的并发：** 读循环不等请求处理完，否则慢请求期间连 socket 都不读，PTZ 的 `stop` 进不了处理。登录除外：下一条消息的解密依赖它。
 - **回放筛选类型：** 14 的 `<recordType>` 要列出 `crossline,intrusion,loitering`；片段的 `recordType` 保留 `md`，只有 `sched` 在有其他类型时才去掉。199 的 `aitype` 第 0 位是 Motion：Reolink Client 的 SDK 里，`GetSupportMDEvent` 读这一位，`GetSupportPeopleEvent` 读同一字段的第 1 位。
-- **通知里的事件类型：** Tamper 是 `aitype` 第 13 位（第 25 位只对应设置页开关），越界、警戒区和徘徊是 `smartAI` 第 1–3 位。199 的 `eventTypeVersion` 按 SDK 的 `Get...EventLog` 位填写（越界 9、警戒区 10、Tamper 18），字段名是推断的。
+- **通知里的事件类型：** Tamper 是 `aitype` 第 13 位（第 25 位只对应设置页开关），越界、警戒区和徘徊是 `smartAI` 第 1–3 位。
+- **不要声明 `eventTypeVersion`：** 199 带这个字段时，回放筛选会多出 Answered Call、Crying Sound 这类摄像头没有的事件（这些名称是 Reolink 客户端自带的）。去掉后这些事件消失，NVR 的通知设置里越界和入侵仍在（BackDoor 真机确认）。
 - **灯和红外按钮：** 白光灯来自 199 的 `ledCtrl` 和 `lightType`。151 的 `ledState` 是 LED/红外控制，声明它会多出红外按钮，所以不声明。海康的白光灯通常在 `supplementLight`；DS-2CD2347G1-L 没有这个接口（HTTP 403），开关在 `/ISAPI/System/externalDevice` 的 `SupplementLight`。它的 `auto` 模式白天不亮，所以开灯时改成全天 `schedule` 和手动亮度，关灯时写回原配置。
 - **告警推送：** 日志里真实的 NVR 和手机 App 登录后都没有发过 31（订阅），所以 33 推给所有已登录的连接，不等订阅。
 

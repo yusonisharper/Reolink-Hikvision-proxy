@@ -672,12 +672,11 @@ def test_alert_parts_that_are_not_alerts_are_ignored():
     assert hik.parse_part({"content-type": "application/json"}, b'{"a": 1}') is None
 
 
-def test_event_types_follow_what_the_camera_entry_has():
+def test_199_does_not_declare_an_event_type_version():
+    """With it, the playback filter listed Answered Call and Crying Sound (seen on a real NVR)."""
     cam, _ = _cam(ai_types=["people", "vehicle"])
-    assert cam.event_type_bits == 1 | 1 << 1 | 1 << 2       # no smart zones, no tamper
-    assert not cam.aitype_bits & 1 << 13
-    v199 = cam.templates.render(199, cam.template_vars()).decode()
-    assert f"<eventTypeVersion>{cam.event_type_bits}</eventTypeVersion>" in v199
+    assert not cam.aitype_bits & 1 << 13        # no tamper
+    assert "eventTypeVersion" not in cam.templates.render(199, cam.template_vars()).decode()
 
 
 def test_end_of_an_undeclared_smart_event_leaves_motion_and_people_alone():
@@ -744,7 +743,6 @@ def test_scene_change_as_tamper_on_a_camera_without_people_or_vehicle():
     assert asyncio.run(run()) == (True, False, True)    # only scene change on still shows as on
     assert b"<enabled>true" in fake.docs[tamper] and b"<enabled>true" in fake.docs[scene]
     assert cam.hikcfg.has_tamper and cam.aitype_bits == 1 << 25 | 1 << 13 | 1     # no people or vehicle, motion stays
-    assert cam.event_type_bits == 1 | 1 << 9 | 1 << 10 | 1 << 18
 
     cam.on_alert(hik.HikAlert("sceneChangeDetection", "active", 1))
     xml = alarm_event_xml(cam.state.snapshot(), report_ai=False, report_smart=True)
