@@ -176,7 +176,7 @@ python tools/bc_client.py 127.0.0.1 -p change-me --preview subStream --out sub.h
 |---|---|
 | BackDoor（DS-2CD2087G2-L） | ✅ 已看到，走子码流 |
 | MountainView（DS-2CD2347G2-LU） | ✅ 已看到。子码流返回 `deviceError`，所以读主码流 |
-| CameraTest、MainDoor、Backyard（DS-2CD2347G1-L） | ❓ Hik-Connect 有框，但 CameraTest 抓了 5 分钟没有目标，包格式也不同。MainDoor 和 Backyard 还没在主码流上测 |
+| CameraTest、MainDoor、Backyard（DS-2CD2347G1-L） | ✅ 有人在 CameraTest 画面里走动时看到了，Backyard 也出现过一次，用的是它们自己的列表格式（主码流；子码流返回 `deviceError`）。没有画回帧上核对：这几台没有录像 |
 | Road（DS-2CD7526G0-IZHS） | ❌ 45 秒内没看到 |
 | Crossroad（DS-2CD4232FWD-IZH8） | ❌ 拿不到会话 token（HTTP 403） |
 | 大华 | ❌ 没有查，已关闭 |

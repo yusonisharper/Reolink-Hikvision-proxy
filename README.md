@@ -176,7 +176,7 @@ Places that do not have them: RTSP has only video and audio. Its `isapi.metadata
 |---|---|
 | BackDoor (DS-2CD2087G2-L) | ✅ Seen, on the sub stream |
 | MountainView (DS-2CD2347G2-LU) | ✅ Seen. Its sub stream answers `deviceError`, so this reads the main stream |
-| CameraTest, MainDoor, Backyard (DS-2CD2347G1-L) | ❓ Hik-Connect shows boxes, but 5 minutes on CameraTest gave none, in a different packet format. MainDoor and Backyard not tested on the main stream |
+| CameraTest, MainDoor, Backyard (DS-2CD2347G1-L) | ✅ Seen on CameraTest while somebody walked through, and once on Backyard, in their own form of the list (main stream; the sub stream answers `deviceError`). Not drawn on frames for a check: no recordings on these |
 | Road (DS-2CD7526G0-IZHS) | ❌ None seen, 45 s |
 | Crossroad (DS-2CD4232FWD-IZH8) | ❌ No session token (HTTP 403) |
 | Dahua | ❌ Not looked at; off |

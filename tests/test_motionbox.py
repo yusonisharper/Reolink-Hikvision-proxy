@@ -108,7 +108,32 @@ def test_the_format_with_more_after_each_target(count):
     assert len({b.track for b in boxes}) == int(count)
 
 
-@pytest.mark.parametrize("packet", REAL["not_targets"], ids=range(len(REAL["not_targets"])))
+def test_the_g1_format_from_somebody_walking_through_the_picture():
+    lists = [motionbox.target_list(bytes.fromhex(h)) for h in REAL["g1_targets"]]
+    assert all(found and found[0] == "0401" for found in lists)
+    counts = [len(found[1]) for found in lists]
+    assert counts == [1, 2, 3, 4, 2, 4, 1]          # the count byte of each packet
+    for _, boxes in lists:
+        for b in boxes:
+            assert 0 <= b.x1 < b.x2 <= GRID_W and 0 <= b.y1 < b.y2 <= GRID_H
+    # the same person keeps a track number from packet to packet
+    assert {b.track for b in lists[0][1]} <= {b.track for b in lists[1][1]}
+    assert {3569, 3570, 3571} <= {b.track for b in lists[2][1]} & {b.track for b in lists[3][1]}
+
+
+def test_a_camera_sending_both_kinds_keeps_to_one():
+    t = CameraTargets("t", None, "h")
+    g1 = motionbox.target_list(bytes.fromhex(REAL["g1_targets"][0]))
+    g2 = motionbox.target_list(bytes.fromhex(REAL["mountainview_targets"]["1"]))
+    t._take(*g1)
+    assert t.boxes() == g1[1]
+    t._take(*g2)
+    assert t.boxes() == g2[1]
+    t._take(*g1)                    # the G2 kind won: the other no longer replaces it
+    assert t.boxes() == g2[1]
+
+
+@pytest.mark.parametrize("packet", REAL["not_targets"] + [REAL["g1_rule"]], ids=range(len(REAL["not_targets"]) + 1))
 def test_other_private_packets_give_nothing(packet):
     assert parse_targets(bytes.fromhex(packet)) is None
 

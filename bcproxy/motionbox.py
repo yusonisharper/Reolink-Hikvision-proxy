@@ -13,9 +13,12 @@ with private packets (payload type 112). The same packets are stored in recordin
     offset 12  ff ff 23 xx
     offset 22  target count
     offset 23  1 byte, then width and height as u16 with the top bit set (coordinates count in these)
-    each target, from a byte boundary: 10 zero bits, 1 flag bit, 9 zero bits, 15 bits of id,
+    each target, from a byte boundary: 10 zero bits, 1 flag bit, 9 bits (0, or 256 on G1), 15 bits of id,
     then x, y, width, height, each Exp-Golomb coded like ue(v) in H.265
     xx 0x25: 6 more bytes after each target. 0x23: none. Other values are not known.
+    DS-2CD2347G1-L: marker ff ff 04 01, the same from the count on but 6 bytes earlier (count at 16),
+    on a 160x120 grid. Seen while somebody walked through the picture; checked for a layout that decodes
+    every packet exactly, which only one does. Not drawn on its frames: these cameras have no recordings.
 
 Checked on a recording, whose packets of type 9 hold the same boxes as plain floats: 351 of 351 lists agree.
 
@@ -149,30 +152,34 @@ class _Bits:
         self.pos = (self.pos + 7) & ~7
 
 
-def parse_targets(packet: bytes) -> tuple[Box, ...] | None:
-    """A private packet, from its type. None when it is not a target list, or not one understood:
+def target_list(packet: bytes) -> tuple[str, tuple[Box, ...]] | None:
+    """(kind, boxes) of a private packet. None when it is not a target list, or not one understood:
     anything out of place gives no boxes rather than wrong ones."""
-    if packet[:2] != struct.pack(">H", PRIVATE_TARGETS) or packet[12:15] != b"\xff\xff\x23" or len(packet) < 28:
+    if packet[:2] != struct.pack(">H", PRIVATE_TARGETS) or packet[12:14] != b"\xff\xff":
         return None
-    extra = EXTRA_BYTES.get(packet[15])
-    if extra is None:
+    if packet[14] == 0x23:
+        kind, extra, head = "23", EXTRA_BYTES.get(packet[15]), 22
+    elif packet[14:16] == b"\x04\x01":        # DS-2CD2347G1-L, while somebody walks through the picture
+        kind, extra, head = "0401", 0, 16
+    else:
         return None
-    width, height = struct.unpack_from(">HH", packet, 24)
+    if extra is None or len(packet) < head + 6:
+        return None
+    width, height = struct.unpack_from(">HH", packet, head + 2)
     if not (width & 0x8000 and height & 0x8000):      # the same marker holds other lists, such as the rules
         return None
     width, height = width & 0x7FFF, height & 0x7FFF
     if not (width and height):
         return None
-    bits = _Bits(packet[28:])
+    bits = _Bits(packet[head + 6:])
     boxes = []
     try:
-        for _ in range(packet[22]):
+        for _ in range(packet[head]):
             bits.align()
             if bits.read(10):
                 return None
             bits.read(1)
-            if bits.read(9):
-                return None
+            bits.read(9)                       # 0 on the G2 cameras, 256 on the G1: a kind of target?
             track = bits.read(15)
             x, y, w, h = bits.exp_golomb(), bits.exp_golomb(), bits.exp_golomb(), bits.exp_golomb()
             bits.align()
@@ -183,7 +190,12 @@ def parse_targets(packet: bytes) -> tuple[Box, ...] | None:
                              (y + h) * GRID_H // height, track))
     except IndexError:
         return None
-    return tuple(boxes[:MAX_BOXES])
+    return kind, tuple(boxes[:MAX_BOXES])
+
+
+def parse_targets(packet: bytes) -> tuple[Box, ...] | None:
+    found = target_list(packet)
+    return found[1] if found else None
 
 
 def rtp_private_packet(rtp: bytes) -> bytes | None:
@@ -231,6 +243,7 @@ class CameraTargets:
         self._boxes: tuple[Box, ...] = ()
         self._fresh = float("-inf")
         self._stream = WS_STREAMS[0]
+        self._kind: str | None = None
 
     def boxes(self) -> tuple[Box, ...]:
         return self._boxes if time.monotonic() - self._fresh <= STALE_SECONDS else ()
@@ -253,6 +266,14 @@ class CameraTargets:
         if self._task:
             self._task.cancel()
             self._task = None
+
+    def _take(self, kind: str, boxes: tuple[Box, ...]) -> None:
+        """A camera sending both kinds would make the boxes jump between two lists: the first kind seen
+        wins, except that the G2 kind (23) replaces the G1 one (0401)."""
+        if self._kind is None or (kind == "23" and self._kind != "23"):
+            self._kind = kind
+        if kind == self._kind:
+            self._publish(boxes)
 
     def _publish(self, boxes: tuple[Box, ...]) -> None:
         if not self.supported:
@@ -312,9 +333,9 @@ class CameraTargets:
                 if opcode == 2:
                     packet = rtp_private_packet(data)
                     if packet is not None:
-                        boxes = parse_targets(packet)
-                        if boxes is not None:
-                            self._publish(boxes)
+                        found = target_list(packet)
+                        if found is not None:
+                            self._take(*found)
                 elif opcode == 1:
                     answer = json.loads(data)
                     if answer.get("statusCode", 1) != 1:
