@@ -345,7 +345,8 @@ def test_audio_never_lands_inside_a_video_frame():
             await asyncio.sleep(0)      # what a busy socket does in drain()
         src.info = StreamInfo("H265", 640, 360, 15)
         s.send, s.tag, s._spawn = send, "t", asyncio.create_task
-        s.cam = SimpleNamespace(hikcfg=None, audio_on=True, audio=SimpleNamespace(subscribe=lambda: audio, unsubscribe=lambda q: None))
+        s.cam = SimpleNamespace(hikcfg=None, audio_on=True, motion_boxes=None,
+                                audio=SimpleNamespace(subscribe=lambda: audio, unsubscribe=lambda q: None))
         req = SimpleNamespace(reply=lambda code, payload=b"", **kw: payload)
         task = asyncio.create_task(s._stream(req, src, "mainStream"))
         while video.qsize() or len(sent) < 30:

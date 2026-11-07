@@ -9,7 +9,7 @@ import time
 from string import Template
 from xml.sax.saxutils import escape as xml_escape
 
-from . import bc, bcmedia
+from . import bc, bcmedia, motionbox
 from . import playback as pb
 from . import settings as st
 from .bc import BcMsg, body_xml, ext_xml, xml_value
@@ -534,6 +534,10 @@ class BcSession:
         if self.cam.hikcfg:
             self._spawn(self.cam.request_keyframe(stype))
         log.info("%s: preview %s started", self.tag, stype)
+        boxes = self.cam.motion_boxes
+        box_encoder = motionbox.FrameEncoder() if boxes else None
+        if boxes:
+            boxes.add_viewer()
         frames = sent = 0
         t_start = time.monotonic()
         audio_task = None
@@ -563,8 +567,9 @@ class BcSession:
                     if self.cam.audio and self.cam.audio_on:
                         audio_task = self._spawn(self._audio(req, frame_lock))
                 micros = int((ts - t0) * 1_000_000)
-                frame = (bcmedia.iframe(info.codec, au.data, micros, int(time.time()))
-                         if au.keyframe else bcmedia.pframe(info.codec, au.data, micros))
+                ext = box_encoder.encode(micros, boxes.boxes()) if boxes and boxes.supported else b""
+                frame = (bcmedia.iframe(info.codec, au.data, micros, int(time.time()), ext=ext)
+                         if au.keyframe else bcmedia.pframe(info.codec, au.data, micros, ext=ext))
                 async with frame_lock:
                     for i in range(0, len(frame), MEDIA_CHUNK):
                         await self.send(req.reply(200, payload=frame[i:i + MEDIA_CHUNK], binary=True))
@@ -581,6 +586,8 @@ class BcSession:
             if audio_task:
                 audio_task.cancel()
             src.unsubscribe(q)
+            if boxes:
+                boxes.remove_viewer()
             log.info("%s: preview %s stopped after %.1fs: %d frames, %d KB", self.tag, stype,
                      time.monotonic() - t_start, frames, sent // 1024)
 

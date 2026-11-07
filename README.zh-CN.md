@@ -144,7 +144,7 @@ python tools/bc_client.py 127.0.0.1 -p change-me --preview subStream --out sub.h
 | Tamper Alert | 🟡 待 App 验证 | 199 `aitype` 第 25 位声明能力，763/764 读写海康遮挡侦测开关；海康 `shelteralarm` 上报为 `tamper` |
 | 手动灯 | 🟡 待 App 验证 | 288 → 海康 supplementLight，`light_seconds`（默认 30 秒）后恢复原模式，291 推送状态 |
 | 声音 | 🟡 待 App 验证 | 主码流音频转码为 16 kHz AAC，随预览发送（仅预览；海康无喇叭，不支持对讲） |
-| Motion Boxes | ❌ 未实现 | 现有真机抓包中没有相关消息，需要抓开启该功能的真机 |
+| Motion Boxes | 🟡 待 App 验证 | 只在实时预览，用相机自己的目标框，只在发这种数据的相机上生效。端到端验证到 Reolink Client 自己的解析器；屏幕显示和经 NVR 转发还没看到。详见下文 |
 | 回放 | 🟡 待验证 | 海康 SD 卡：ISAPI 录像搜索 + RTSP 回放（只播所选的一段，播完停止）→ 102/142/14/15/16/381/382，拖动 383；海康无存储时自动关闭。298 时间轴缩略图未实现 |
 | 局域网自动搜索 | 🟡 代码完成 | UDP 2000，回复格式按真机抓包；已确认 NVR 的搜索包能收到并回复，NVR“添加摄像头”列表中的显示还待确认 |
 | 其他消息 | ❌ 未知 | 110、113、122 等回空 200；257 回 400、789/818 回 405（与真机一致） |
@@ -162,11 +162,29 @@ python tools/bc_client.py 127.0.0.1 -p change-me --preview subStream --out sub.h
 
 拖动进度条还有问题（App 上的具体表现待整理）。383 的回复格式是推断的，没有真机样本；真机上拖动时的抓包还没拿到。录像列表为了不超过单条消息上限会合并片段，拖到合并产生的空档会落到下一段真实录像。
 
-### TODO：Motion Boxes
+### Motion Boxes
 
-视频帧的扩展区里带框的数据（抓自 NVR 主码流，App 本地绘制，预览请求没有开关字段）：`ff <len16> { 01 0b00 { 01 0800 <u64 时间> } 02 <len16> { 01 0400 "lz4 " 02 <len16> <LZ4 帧> } }`。I 帧前面另有 8 字节时间。解压后是嵌套 TLV（`<u8 类型> <u16 长度> <值>`），网格 640×352（类型 3），每个框是类型 4：`x1 y1 x2 y2 score`（u16），可再带跟踪 ID 和类别。
+**格式：** 框放在每个视频帧的扩展区里，由客户端自己绘制。布局见 `bcproxy/motionbox.py`，来自 NVR 主码流抓包，并直接调用 Reolink Client `libBCSDKWrapper` 里的帧解析函数核对过：同样的框，解析结果和真机帧只差我们自己选的分数和类别；没有框的帧，解析结果和真机完全相同。
 
-还缺实时目标坐标：海康 RTSP 只有视频和音频。海康 App 的回放能显示框，所以数据应该和录像存在一起，下一步从这里查。App 的开关可能由 199 的 `thumbnail`、`ptzControl` 或 `newIspCfg` 第 6、7 位控制，未验证。
+**开关：** Reolink Client 只要收到带这种数据的帧就会显示开关（`hasAiData` 会设置 `supportAiMark`），和 199 的能力位无关。所以相机发出第一个目标列表后，帧才带扩展区；从不发目标的相机不会出现开关。手机 App 的判断方式这里看不到。
+
+**框从哪来：** 只来自相机，代理上不做任何计算。Hik-Connect 画的框随网页预览的码流一起发：WebSocket 7681 端口（先取 `/ISAPI/Security/token`，再发 `realplay`），RTP 里的私有包（payload type 112），和录像里存的是同一种。包的布局见 `bcproxy/motionbox.py`。用一段同时存了两份框的录像核对过：压缩形式的 351 个列表全部和明文一致。画回录像自己的帧上，框都落在车上。
+
+这些地方没有：RTSP 只有视频和音频。它的 `isapi.metadata` 轨（在 `/ISAPI/Streaming/channels/101`）每个目标只有一个样本，告警里的 `TargetRect` 也只有一个样本。`httpPreview` 返回 403。
+
+| 相机 | 实时目标框 |
+|---|---|
+| BackDoor（DS-2CD2087G2-L） | ✅ 已看到，走子码流 |
+| MountainView（DS-2CD2347G2-LU） | ✅ 已看到。子码流返回 `deviceError`，所以读主码流 |
+| CameraTest、MainDoor、Backyard（DS-2CD2347G1-L） | ❓ Hik-Connect 有框，但 CameraTest 抓了 5 分钟没有目标，包格式也不同。MainDoor 和 Backyard 还没在主码流上测 |
+| Road（DS-2CD7526G0-IZHS） | ❌ 45 秒内没看到 |
+| Crossroad（DS-2CD4232FWD-IZH8） | ❌ 拿不到会话 token（HTTP 403） |
+| 大华 | ❌ 没有查，已关闭 |
+
+- **成本：** 有人观看时多一条到相机的连接，而 NVR 全天都在看。不解码：代理只读包头和目标列表。BackDoor 子码流约 330 kbps；回退到主码流的相机，会把整路主码流发到代理。Cloud Key 上的 CPU 占用还没测。
+- **依赖：** 相机的 WebSocket 服务要开着。用 `motion_boxes: false` 关闭此功能。
+- **延迟：** 框和视频走不同的连接，没有逐帧对齐。
+- **没有覆盖：** 回放还没有框。`ISAPI/ContentMgmt/download` 能拿到录像里同样的包，可以从这里开始。
 
 ### 协议上踩过的坑
 
@@ -288,7 +306,7 @@ tests/          协议测试（使用 neolink 的真机样本）+ 端到端测�
 
 ## 其他限制
 
-- 未实现：对讲、海康 PTZ、Motion Boxes、UDP/P2P 连接。回放只回放视频（无音频），播放速度固定 1 倍。
+- 未实现：对讲、海康 PTZ、回放里的 Motion Boxes、UDP/P2P 连接。回放只回放视频（无音频），播放速度固定 1 倍。
 - 图像页（25/26/132）读写海康：亮度、对比度、饱和度、锐度、镜像翻转、电源频率、日夜模式、白平衡、3D 降噪。曝光、增益、背光、色调没有对接，保存后不生效。
 - 服务器设置（37/38）读写海康：HTTPS、ONVIF 可改；禁用海康 HTTP/RTSP 或改它们的端口会被拒绝，因为代理依赖它们。
 - 只保存在代理、不会写到海康的设置：移动侦测（47）、OSD、网络类页面（DHCP、DDNS、UPnP）。

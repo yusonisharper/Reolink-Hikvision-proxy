@@ -144,7 +144,7 @@ Tested on a real Reolink NVR and the Reolink mobile app (Hikvision 2688×1520 H.
 | Tamper Alert | 🟡 To verify in the app | Bit 25 of `aitype` in 199 declares it, 763/764 read and write Hikvision's tamper detection switch; Hikvision's `shelteralarm` is reported as `tamper` |
 | Manual light | 🟡 To verify in the app | 288 → Hikvision supplementLight, back to the previous mode after `light_seconds` (default 30 s), 291 pushes the state |
 | Audio | 🟡 To verify in the app | Main stream audio is transcoded to 16 kHz AAC and sent with the preview (preview only; Hikvision has no speaker here, so no two-way audio) |
-| Motion Boxes | ❌ Not implemented | No related messages in the existing captures; needs a capture from a real camera with this feature on |
+| Motion Boxes | 🟡 To verify in the app | Live preview only, with the camera's own target boxes, on the cameras that send them. Checked end to end up to Reolink Client's own parser; drawing on screen and passing through the NVR are not yet seen. See below |
 | Playback | 🟡 To verify | Hikvision SD card: ISAPI recording search + RTSP playback (only the selected clip, stops at its end) → 102/142/14/15/16/381/382, seeking 383; off automatically when Hikvision has no storage. 298 timeline thumbnails are not implemented |
 | LAN discovery | 🟡 Code done | UDP 2000, reply format follows real captures; the NVR's search packets are confirmed received and answered, display in the NVR's "add camera" list still to be confirmed |
 | Other messages | ❌ Unknown | 110, 113, 122 etc. answer an empty 200; 257 answers 400, 789/818 answer 405 (same as a real camera) |
@@ -162,11 +162,29 @@ Measured (2.0 Mbps main stream): parsing, packaging and encryption about 0.16% o
 
 Dragging the progress bar still has problems (the exact behavior in the app is yet to be written down). The reply format of 383 is inferred, with no sample from a real camera, and a capture of seeking on a real camera is still missing. To stay under the size limit of one message, the recording list merges segments, and seeking into a gap this creates lands on the next real recording.
 
-### TODO: Motion Boxes
+### Motion Boxes
 
-The box data in the extension area of video frames (captured from an NVR main stream, drawn locally by the app, with no switch field in the preview request): `ff <len16> { 01 0b00 { 01 0800 <u64 time> } 02 <len16> { 01 0400 "lz4 " 02 <len16> <LZ4 frame> } }`. I frames have another 8 bytes of time in front. Decompressed, it is nested TLV (`<u8 type> <u16 length> <value>`), on a 640×352 grid (type 3). Each box is type 4: `x1 y1 x2 y2 score` (u16), optionally with a tracking ID and class.
+**Format:** The boxes travel in the extension area of each video frame, and the client draws them itself. The layout is in `bcproxy/motionbox.py`, from an NVR main stream capture and checked by calling the frame parser in Reolink Client's `libBCSDKWrapper` directly: for the same boxes, its result differs from a real frame's only in the score and class we choose, and a frame without boxes gives the same result as a real one.
 
-Real-time object coordinates are still missing: Hikvision's RTSP only has video and audio. Playback in Hikvision's app can show boxes, so the data should be stored with the recordings, and that is where to look next. The app's switch may be controlled by `thumbnail`, `ptzControl` or bits 6 and 7 of `newIspCfg` in 199, not verified.
+**The switch:** Reolink Client shows it once a frame carries this data (`hasAiData` sets `supportAiMark`). No capability bit in 199 is involved. So frames carry the extension only after the camera has sent its first target list, and a camera that sends none shows no option. The mobile app's check is not visible from here.
+
+**Where the boxes come from:** Only from the camera; nothing is computed on the proxy. What Hik-Connect draws comes with the stream of the web preview: a WebSocket on port 7681 (`/ISAPI/Security/token`, then `realplay`), RTP with private packets of payload type 112, the same ones stored in recordings. The packet layout is in `bcproxy/motionbox.py`. Checked on a recording that holds the same boxes twice: all 351 lists of the compressed form agree with the plain one. Drawn on the recording's own frames, the boxes sit on the vehicles.
+
+Places that do not have them: RTSP has only video and audio. Its `isapi.metadata` track (at `/ISAPI/Streaming/channels/101`) gives one sample per target, and an alert's `TargetRect` is also one sample. `httpPreview` answers 403.
+
+| Camera | Live target boxes |
+|---|---|
+| BackDoor (DS-2CD2087G2-L) | ✅ Seen, on the sub stream |
+| MountainView (DS-2CD2347G2-LU) | ✅ Seen. Its sub stream answers `deviceError`, so this reads the main stream |
+| CameraTest, MainDoor, Backyard (DS-2CD2347G1-L) | ❓ Hik-Connect shows boxes, but 5 minutes on CameraTest gave none, in a different packet format. MainDoor and Backyard not tested on the main stream |
+| Road (DS-2CD7526G0-IZHS) | ❌ None seen, 45 s |
+| Crossroad (DS-2CD4232FWD-IZH8) | ❌ No session token (HTTP 403) |
+| Dahua | ❌ Not looked at; off |
+
+- **Cost:** One more connection to the camera while somebody watches, and an NVR watches all day. No decoding: the proxy only reads packet headers and the target lists. Measured at about 330 kbps on BackDoor's sub stream; a camera falling back to its main stream sends that whole stream to the proxy. The CPU load on the Cloud Key is not measured.
+- **Requires:** The camera's WebSocket service on. Turn the feature off with `motion_boxes: false`.
+- **Delay:** Boxes and video come over separate connections, so they are not matched frame by frame.
+- **Not covered:** Playback has no boxes yet. `ISAPI/ContentMgmt/download` gives the same packets for a recording, which is where to start.
 
 ### Protocol pitfalls
 
@@ -287,7 +305,7 @@ tests/          Protocol tests (using real camera samples from neolink) + end-to
 
 ## Other limitations
 
-- Not implemented: two-way audio, Hikvision PTZ, Motion Boxes, UDP/P2P connections. Playback is video only (no audio), at a fixed 1× speed.
+- Not implemented: two-way audio, Hikvision PTZ, Motion Boxes in playback, UDP/P2P connections. Playback is video only (no audio), at a fixed 1× speed.
 - The image page (25/26/132) reads and writes Hikvision: brightness, contrast, saturation, sharpness, mirror and flip, power frequency, day/night mode, white balance, 3D noise reduction. Exposure, gain, backlight and hue are not connected, and saving them has no effect.
 - Server settings (37/38) read and write Hikvision: HTTPS and ONVIF can be changed. Disabling Hikvision's HTTP or RTSP or changing their ports is refused, because the proxy depends on them.
 - Settings only stored in the proxy and never written to Hikvision: motion detection (47), OSD, network pages (DHCP, DDNS, UPnP).

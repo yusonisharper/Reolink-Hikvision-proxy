@@ -19,6 +19,7 @@ from .bc import body_xml, xml_value
 from .events import AI_TYPES, SMART_TYPES, DetEvent, EventState, Holds, Snapshot
 from .hikcfg import HikConfig
 from .media import AudioSource, RateMeter, StreamInfo, StreamSource
+from .motionbox import CameraTargets
 from .playback import EventJournal, HikRecordings
 from .settings import SettingsStore
 from .templates import Templates
@@ -68,7 +69,8 @@ class CameraConfig:
     playback: bool = True              # serve the Hikvision SD card recordings to the app/NVR
     playback_track: int = 101          # Hikvision record track (101 = main stream)
     audio: bool = True                 # forward the microphone (main stream audio, AAC transcoded)
-    light_seconds: int = 30            # the manual light switches itself off after this long
+    motion_boxes: bool = True          # the camera's own target boxes in live preview, if it sends them
+    light_seconds: int = 30           # the manual light switches itself off after this long
     ptz_max_seconds: int = 30          # a PTZ move without a stop ends after this long
     # events
     ai_types: list[str] = field(default_factory=lambda: ["people", "vehicle"])
@@ -155,6 +157,8 @@ class VirtualCamera:
         self.main =StreamSource(f"{cfg.name}/main", cfg.main_rtsp, cfg.main_info) if cfg.main_rtsp else None
         self.sub = StreamSource(f"{cfg.name}/sub", cfg.sub_rtsp or cfg.main_rtsp, cfg.sub_info) \
             if (cfg.sub_rtsp or cfg.main_rtsp) else None
+        self.motion_boxes = CameraTargets(cfg.name, self.http, cfg.hik_host) \
+            if cfg.motion_boxes and self.http and not is_dahua else None
         self.recordings = None
         if self.http and cfg.playback and cfg.main_rtsp:
             self.recordings = dahua.DahuaRecordings(self.http, cfg.hik_channel) if is_dahua \
@@ -238,6 +242,8 @@ class VirtualCamera:
     async def stop(self) -> None:
         for t in self._tasks:
             t.cancel()
+        if self.motion_boxes:
+            self.motion_boxes.stop()
         await self._ptz_stop_logged()
         if self._light_task:      # don't leave a timed light burning without its timer
             try:
