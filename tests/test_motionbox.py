@@ -167,9 +167,22 @@ def test_the_private_packet_of_an_rtp_packet():
 # the Reolink frame extension
 # ---------------------------------------------------------------------------
 
-def test_a_frame_without_boxes_is_the_same_as_a_real_one():
+def test_a_frame_without_boxes_still_has_its_time_sequence_and_grid():
+    """A real frame of only empty groups leaves the client drawing the last boxes: this one clears them."""
     real = unpack((SAMPLES / "motionbox_real_empty.bin").read_bytes())[1]
-    assert unpack(FrameEncoder().encode(5, ()))[1] == real
+    enc = FrameEncoder()
+    enc.encode(1000, (BOX,))
+    ours = unpack(enc.encode(2000, ()))[1]
+    assert ours != real
+    sections = dict(_tlvs(ours))
+    assert sections[4] == dict(_tlvs(real))[4]
+    for section in (1, 2, 3):
+        groups = dict(_tlvs(sections[section]))
+        values = dict(_tlvs(groups[2]))
+        assert struct.unpack("<Q", values[1])[0] == 1000
+        assert struct.unpack("<Q", values[5])[0] == 2
+        assert struct.unpack("<HH", values[3]) == (GRID_W, GRID_H)
+        assert 4 not in values
 
 
 def test_a_frame_with_boxes_has_the_shape_of_a_real_one():

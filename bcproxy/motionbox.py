@@ -30,7 +30,9 @@ Reolink frame extension, from an NVR main stream capture, checked against libBCS
 Decompressed: TLVs of <u8 type> <u16 length> <value>. Types 1, 2 and 3 are sections of groups 3, 1 and 2,
 each group holding time (1), sequence (5) and grid (3). Group 2 also holds the boxes (4):
 x1 y1 x2 y2 score as u16, and in section 2 track u16, 0, class u8; in section 3 track u16, class u8.
-Type 4 is a constant, its meaning unknown. Frames without boxes have only an empty 2 in each group.
+Type 4 is a constant, its meaning unknown. Frames without boxes have only an empty 2 in each group; the
+client reads those as no data and keeps the last boxes, so the frames sent here keep time, sequence and
+grid with no box in them, which clears them.
 """
 from __future__ import annotations
 
@@ -90,11 +92,9 @@ def _lz4_frame(data: bytes) -> bytes:
 
 
 def _boxes_payload(boxes: tuple[Box, ...], micros: int, seq: int) -> bytes:
-    """The decompressed data of one frame."""
-    if not boxes:
-        empty = _tlv(2, b"")
-        group = _tlv(3, empty) + _tlv(1, empty) + _tlv(2, empty)
-        return _tlv(1, group) + _tlv(2, group) + _tlv(3, group) + _tlv(4, TRAILER)
+    """The decompressed data of one frame. Without boxes it still holds time, sequence and grid: the
+    client's parser takes a frame of only empty groups as one without data, and keeps drawing the
+    boxes it had, so a target that left the picture would stay on screen."""
     meta = _tlv(1, struct.pack("<Q", micros)) + _tlv(5, struct.pack("<Q", seq)) \
         + _tlv(3, struct.pack("<HH", GRID_W, GRID_H))
     plain = detailed = person = b""
