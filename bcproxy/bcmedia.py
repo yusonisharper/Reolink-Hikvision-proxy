@@ -30,8 +30,8 @@ def info_v2(width: int, height: int, fps: int) -> bytes:
 
 def iframe(codec: str, data: bytes, micros: int, unix_time: int | None = None, file_no: int = 0,
            ext: bytes = b"") -> bytes:
-    """file_no: last header field. In replay real cameras change it when the next recording file
-    starts (same value for all frames of a file); that is how the app notices the switch.
+    """file_no: last header field. Live, it is the high half of the time (micros >> 32). In replay real
+    cameras change it when the next recording file starts (same value for all frames of a file).
     ext: the extension data of the frame (motion boxes), after the time."""
     extra = (b"" if unix_time is None else struct.pack("<II", unix_time & 0xFFFFFFFF, 0)) + ext + _pad(len(ext))
     hdr = struct.pack("<I4sIIII", MAGIC_IFRAME, codec.encode(), len(data), len(extra),

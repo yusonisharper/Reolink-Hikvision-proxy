@@ -93,6 +93,7 @@ def load(path: str) -> AppConfig:
             event_map=ev.get("event_map") or {}, target_map=ev.get("target_map") or {},
             region_base=int(ev.get("region_base", 1)),
             main_info=_stream_info(hik.get("main_info")), sub_info=_stream_info(hik.get("sub_info")),
+            debug_wrap_in=float(c.get("debug_wrap_in", 0)),
         ))
     lh, lp = (None, None)
     if raw.get("hik_listen"):

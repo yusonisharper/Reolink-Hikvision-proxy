@@ -84,6 +84,7 @@ class CameraConfig:
     # stream overrides (skip ffprobe)
     main_info: StreamInfo | None = None
     sub_info: StreamInfo | None = None
+    debug_wrap_in: float = 0           # testing: live frame time reaches a 32-bit wrap this many s after start
 
 
 # 151 <AbilityInfo> block that makes the app offer playback (from a real camera)

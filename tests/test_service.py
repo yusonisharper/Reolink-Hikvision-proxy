@@ -345,7 +345,7 @@ def test_audio_never_lands_inside_a_video_frame():
             await asyncio.sleep(0)      # what a busy socket does in drain()
         src.info = StreamInfo("H265", 640, 360, 15)
         s.send, s.tag, s._spawn = send, "t", asyncio.create_task
-        s.cam = SimpleNamespace(hikcfg=None, audio_on=True, motion_boxes=None,
+        s.cam = SimpleNamespace(hikcfg=None, audio_on=True, motion_boxes=None, cfg=_time_cfg(),
                                 audio=SimpleNamespace(subscribe=lambda: audio, unsubscribe=lambda q: None))
         req = SimpleNamespace(reply=lambda code, payload=b"", **kw: payload)
         task = asyncio.create_task(s._stream(req, src, "mainStream"))
@@ -768,3 +768,68 @@ def test_frame_rate_is_checked_on_the_status_poll(monkeypatch):
         return cam.main.info.fps
 
     assert asyncio.run(run()) == 25
+
+
+def _time_cfg(wrap_in=0.0):
+    return SimpleNamespace(debug_wrap_in=wrap_in)
+
+
+def _frame_times(wrap_in, frames):
+    """(kind, micros) of what one preview sends, frames given as (seconds, keyframe)."""
+    import struct
+    from bcproxy.bcmedia import MAGIC_IFRAME, MAGIC_INFO_V2, MAGIC_PFRAME, AccessUnit
+    from bcproxy.media import StreamInfo
+    from bcproxy.session import BcSession
+
+    async def run():
+        video = asyncio.Queue()
+        for t, key in frames:
+            nal = bytes([0, 0, 0, 1, 0x26 if key else 0x02])
+            video.put_nowait((t, AccessUnit(nal + bytes(8), key)))
+        info = StreamInfo("H265", 640, 360, 15)
+
+        async def _info():
+            return info
+        src = SimpleNamespace(ensure_info=_info, subscribe=lambda **kw: video, unsubscribe=lambda q: None, info=info)
+        s = BcSession.__new__(BcSession)
+        sent = []
+
+        async def send(msg):
+            sent.append(msg)
+        s.send, s.tag, s._spawn = send, "t", asyncio.create_task
+        s.cam = SimpleNamespace(hikcfg=None, audio_on=False, audio=None, motion_boxes=None,
+                                cfg=_time_cfg(wrap_in))
+        req = SimpleNamespace(reply=lambda code, payload=b"", **kw: payload)
+        task = asyncio.create_task(s._stream(req, src, "subStream"))
+        while video.qsize():
+            await asyncio.sleep(0)
+        await asyncio.sleep(0)
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+        return sent
+
+    out = []
+    for p in asyncio.run(run()):
+        magic = struct.unpack_from("<I", p)[0]
+        if magic == MAGIC_INFO_V2:
+            out.append(("info", None))
+        elif magic in (MAGIC_IFRAME, MAGIC_PFRAME):
+            out.append(("I" if magic == MAGIC_IFRAME else "P", struct.unpack_from("<II", p, 16)))
+    return out
+
+
+FRAMES = [(1000.0, True), (1000.5, False), (1001.0, False), (1001.5, False), (1002.0, True), (1002.5, False)]
+
+
+def test_frame_time_is_the_device_clock():
+    """A restarted proxy must go on forward: the app's live view stops for good when the time goes back."""
+    times = [lo for k, (lo, hi) in ((k, m) for k, m in _frame_times(0, FRAMES) if k != "info")]
+    assert times == [1_000_000_000, 1_000_500_000, 1_001_000_000, 1_001_500_000, 1_002_000_000, 1_002_500_000]
+
+
+def test_frame_time_carries_its_high_half_over_the_wrap():
+    sent = [m for k, m in _frame_times(1.2, FRAMES) if k != "info"]
+    full = [hi << 32 | lo for lo, hi in sent]
+    assert sent[0][0] == (1 << 32) - 1_200_000 and sent[0][1] == 0
+    assert sent[3] == (300_000, 1)
+    assert all(b - a == 500_000 for a, b in zip(full, full[1:]))

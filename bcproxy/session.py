@@ -23,6 +23,11 @@ from .templates import SMART_MSG, smart_detect_xml
 log = logging.getLogger("bc")
 
 MEDIA_CHUNK = 32 * 1024
+# Live frame time: microseconds since the device started, like a real camera's, so a restarted proxy
+# goes on forward. The header holds it as two u32: the low half, then the high half in the last field
+# (real cameras: 0x1 and 0x47 there). Reolink App live view stops for good when the time goes back:
+# the low half wrapping every 71.6 minutes with the high half left at 0 did that (2026-11-09).
+WRAP = 1 << 32
 # Real cameras answer these with an empty 200 too (192: seen in a neolink capture;
 # 287: TimeCfg write from the app - the source camera keeps its own NTP time).
 QUIET_OK = {192, 287}
@@ -549,6 +554,7 @@ class BcSession:
             await self.send(req.reply(200, ext=ext_xml(binaryData=1), payload=first, binary=True))
             t0 = None
             waiting_key = True
+            offset = high = 0
             while True:
                 item = await q.get()
                 if item is None:          # backlog dropped
@@ -564,12 +570,21 @@ class BcSession:
                                               binary=True))
                 if t0 is None:
                     t0 = ts
+                    if self.cam.cfg.debug_wrap_in > 0:   # testing: reach the next wrap this many seconds from now
+                        now = int(ts * 1_000_000)
+                        target = ((now >> 32) + 1 << 32) - int(self.cam.cfg.debug_wrap_in * 1_000_000)
+                        while target < now:
+                            target += WRAP
+                        offset = target - now
                     if self.cam.audio and self.cam.audio_on:
                         audio_task = self._spawn(self._audio(req, frame_lock))
-                micros = int((ts - t0) * 1_000_000)
+                micros = offset + int(ts * 1_000_000)
+                if frames and micros >> 32 != high:
+                    log.info("%s: preview %s time passes a 32-bit wrap", self.tag, stype)
+                high = micros >> 32
                 ext = box_encoder.encode(micros, boxes.boxes()) if boxes and boxes.supported else b""
-                frame = (bcmedia.iframe(info.codec, au.data, micros, int(time.time()), ext=ext)
-                         if au.keyframe else bcmedia.pframe(info.codec, au.data, micros, ext=ext))
+                frame = (bcmedia.iframe(info.codec, au.data, micros, int(time.time()), file_no=high, ext=ext)
+                         if au.keyframe else bcmedia.pframe(info.codec, au.data, micros, file_no=high, ext=ext))
                 async with frame_lock:
                     for i in range(0, len(frame), MEDIA_CHUNK):
                         await self.send(req.reply(200, payload=frame[i:i + MEDIA_CHUNK], binary=True))
