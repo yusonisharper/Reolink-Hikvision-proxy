@@ -7,6 +7,7 @@ import json
 import logging
 import os
 import time
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 
 from .bcmedia import AccessUnit, AnnexBParser
@@ -18,6 +19,10 @@ log = logging.getLogger("media")
 STALL_SECONDS = 20.0
 STDERR_KEEP = 400    # bytes, for the log line when ffmpeg exits
 KEYFRAME_REQUEST_EVERY = 5.0   # seconds between short sessions that ask for a keyframe
+# Reolink's mp4 writer (bc_mp4_iso_write_frame: phone and PC client downloads, NVR backups) writes each
+# GOP in one go from at most 600 pieces, two per NAL unit, and drops a GOP that needs more: the file
+# then holds no video. See StreamSource._guard_gop.
+MP4_GOP_PIECES = 600
 REPROBE_EVERY = 30.0           # seconds between probes caused by a new SPS
 
 
@@ -295,6 +300,12 @@ class StreamSource:
         self._task: asyncio.Task | None = None
         self._stop_handle: asyncio.TimerHandle | None = None
         self.rate = RateMeter()
+        # asks the camera for a keyframe (set by the camera when it has a call for that); see _guard_gop
+        self.keyframe_cb: Callable[[], Awaitable[None]] | None = None
+        self._since_key = 0
+        self._gop_asks = 0
+        self._gop_logged = False
+        self._gop_task: asyncio.Task | None = None
 
     async def ensure_info(self) -> StreamInfo:
         if self.info is None:
@@ -352,6 +363,32 @@ class StreamSource:
                 proc.kill()
                 await proc.wait()
 
+    def _guard_gop(self, au: AccessUnit) -> None:
+        """Keep each GOP short enough for Reolink's mp4 writer: at most MP4_GOP_PIECES // (2 * slices)
+        pictures. Hikvision tiled streams (DS-2CD2347G1-L, DS-2CD2347G2-LU main: 3 slices per picture)
+        allow 100, and H.265+ makes GOPs of 120 to 250 pictures; the phone app then saves files with
+        no video. Ask the camera for a keyframe one second before the limit (it comes in under
+        0.7 s), and again every half second if none came."""
+        if au.keyframe:
+            self._since_key, self._gop_asks = 0, 0
+            return
+        self._since_key += 1
+        if self.keyframe_cb is None or self._gop_asks >= 3:
+            return
+        limit = MP4_GOP_PIECES // (2 * max(1, au.slices))
+        fps = self.info.fps if self.info and self.info.fps else 25
+        # one second early: enough for the request (measured 0.25 s to the keyframe), and GOPs that
+        # stay below the limit by themselves are left alone
+        due = limit - fps + self._gop_asks * max(1, fps // 2)
+        if self._since_key < due or (self._gop_task and not self._gop_task.done()):
+            return
+        self._gop_asks += 1
+        if not self._gop_logged:
+            self._gop_logged = True
+            log.info("%s: %d slices per picture: keyframe at least every %d pictures for Reolink's mp4 "
+                     "writer", self.name, au.slices, limit)
+        self._gop_task = asyncio.create_task(self.keyframe_cb(), name=f"gop-{self.name}")
+
     def _reprobe_soon(self) -> None:
         """A new SPS on a running connection: rotating the image changes the size without dropping it."""
         now = time.monotonic()
@@ -398,6 +435,7 @@ class StreamSource:
                             self._reprobe_soon()
                         sps = new_sps
                     for au in aus:
+                        self._guard_gop(au)
                         item = (time.monotonic(), au)
                         for q in list(self.subs):
                             if q.full():

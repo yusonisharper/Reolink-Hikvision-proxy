@@ -8,6 +8,8 @@ import struct
 import time
 from dataclasses import dataclass
 
+from . import hevcps
+
 MAGIC_INFO_V1 = 0x31303031
 MAGIC_INFO_V2 = 0x32303031
 MAGIC_IFRAME = 0x63643030
@@ -99,6 +101,7 @@ class BcMediaReader:
 class AccessUnit:
     data: bytes          # Annex-B, start codes included
     keyframe: bool
+    slices: int = 1      # VCL NAL units (slices) in the picture
 
 
 def _split_nals(buf: bytes) -> tuple[list[bytes], bytes]:
@@ -129,6 +132,8 @@ class AnnexBParser:
         self.cur_has_vcl = False
         self.cur_key = False
         self.params: dict[int, bytes] = {}   # nal type -> latest VPS/SPS/PPS
+        self.flat_ok: dict[bytes, bool] = {}       # H.265 SPS -> may declare one sub-layer (hevcps)
+        self.flat_cache: dict[tuple[bytes, bool], bytes] = {}   # H.265: (original VPS/SPS, flatten) -> sent
 
     # -- NAL classification ---------------------------------------------------
     def _info(self, nal: bytes) -> tuple[int, bool, bool, bool]:
@@ -151,6 +156,34 @@ class AnnexBParser:
 
     def _is_aud(self, t: int) -> bool:
         return t == (9 if self.codec == "H264" else 35)
+
+    def _flatten_sub_layers(self, nals: list[bytes]) -> list[bytes]:
+        """H.265 VPS/SPS of an access unit, rewritten for the NVR (see hevcps):
+        - one temporal sub-layer, when the stream's SPS allows it (hevcps.flattenable); VPS and SPS are
+          rewritten together or not at all;
+        - an SPS longer than Reolink's mp4 writer accepts loses its VUI HRD parameters."""
+        sps = next((n for n in nals if self._info(n)[0] == 33), None) or self.params.get(33)
+        if sps is None:
+            return nals
+        ok = self.flat_ok.get(sps)
+        if ok is None:
+            if len(self.flat_ok) > 8:
+                self.flat_ok.clear()
+                self.flat_cache.clear()
+            ok = self.flat_ok[sps] = hevcps.flattenable(sps)
+        out = []
+        for n in nals:
+            t = self._info(n)[0]
+            if t in (32, 33):
+                new = self.flat_cache.get((n, ok))
+                if new is None:
+                    new = hevcps.single_sub_layer(n) if ok else n
+                    if t == 33:
+                        new = hevcps.fit_mp4_limit(new)
+                    self.flat_cache[(n, ok)] = new
+                n = new
+            out.append(n)
+        return out
 
     # -- feeding --------------------------------------------------------------
     def feed(self, data: bytes) -> list[AccessUnit]:
@@ -177,6 +210,8 @@ class AnnexBParser:
             present = {self._info(n)[0] for n in nals}
             missing = [self.params[t] for t in sorted(self.params) if t not in present]
             nals = missing + nals
-        au = AccessUnit(b"".join(nals), key)
+        if self.codec == "H265":
+            nals = self._flatten_sub_layers(nals)
+        au = AccessUnit(b"".join(nals), key, sum(1 for n in nals if self._info(n)[1]))
         self.cur, self.cur_has_vcl, self.cur_key = [], False, False
         return au

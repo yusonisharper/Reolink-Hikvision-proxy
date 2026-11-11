@@ -158,6 +158,12 @@ class VirtualCamera:
         self.main =StreamSource(f"{cfg.name}/main", cfg.main_rtsp, cfg.main_info) if cfg.main_rtsp else None
         self.sub = StreamSource(f"{cfg.name}/sub", cfg.sub_rtsp or cfg.main_rtsp, cfg.sub_info) \
             if (cfg.sub_rtsp or cfg.main_rtsp) else None
+        if self.hikcfg and self.hikcfg.can_request_keyframe:
+            # short GOPs for Reolink's mp4 writer (StreamSource._guard_gop)
+            if self.main:
+                self.main.keyframe_cb = lambda: self.request_keyframe("mainStream")
+            if self.sub and cfg.sub_rtsp:
+                self.sub.keyframe_cb = lambda: self.request_keyframe("subStream")
         self.motion_boxes = CameraTargets(cfg.name, self.http, cfg.hik_host) \
             if cfg.motion_boxes and self.http and not is_dahua else None
         self.recordings = None
