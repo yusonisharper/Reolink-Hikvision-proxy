@@ -12,6 +12,77 @@
         ──ISAPI 抓图──────────────────────┘
 ```
 
+目录：[快速上手](#快速上手) · [事件映射](#事件映射) · [兼容性状态](#兼容性状态) · [海康 H.265 与 Reolink 下载](#海康-h265-与-reolink-下载) · [Motion Boxes](#motion-boxes) · [大华摄像头](#大华摄像头) · [开发](#开发) · [技术细节](#技术细节)
+
+## 快速上手
+
+### 快速开始
+
+```bash
+pip install -r requirements.txt        # cryptography + PyYAML；另需 ffmpeg/ffprobe
+cp config.example.yaml config.yaml     # 填海康地址/账号/RTSP、虚拟摄像头的 IP 和密码
+python -m bcproxy -c config.yaml -v
+```
+
+然后在 Reolink NVR 中手动添加摄像头：填 `listen` 中的 IP，端口 9000，用户名和密码与配置中的 `username` / `password` 一致。
+
+**一台海康对应一个 IP**：NVR 按 IP 区分摄像头。Linux 上可以给代理主机加别名 IP（`ip addr add 192.168.1.201/24 dev eth0`），或用 Docker macvlan；Windows 的做法见下文。
+
+### Windows 上运行
+
+- `listen` 中的 IP 必须是本机网卡上已有的地址。要加别名 IP，网卡需要先改成静态 IP，再执行
+  `netsh interface ipv4 add address "以太网" 192.168.0.201 255.255.255.0`。
+- 9000 端口可能被 Hyper-V / WSL / Docker 保留（绑定报 `could not bind`）。用 `netsh interface ipv4 show excludedportrange protocol=tcp` 检查；如果被保留，就先 `net stop winnat`，再执行 `netsh int ipv4 add excludedportrange protocol=tcp startport=9000 numberofports=1`，最后 `net start winnat`。
+- 防火墙放行入站 TCP 9000 和 UDP 2000（局域网搜索）：
+  `New-NetFirewallRule -DisplayName "bcproxy 9000" -Direction Inbound -Protocol TCP -LocalPort 9000 -Action Allow`
+  `New-NetFirewallRule -DisplayName "bcproxy search" -Direction Inbound -Protocol UDP -LocalPort 2000 -Action Allow`
+- 本机运行 Reolink Client 时，它会占用 UDP 3000，此时 `tools/bc_discover.py` 无法运行（代理本身不受影响）。
+- 保存完整日志：`python -m bcproxy -c config.yaml -v *> log.txt`
+
+### 部署到 UniFi Cloud Key Gen2 Plus
+
+在 UCK-G2-Plus（UniFi OS 6.0.11，Debian 13，aarch64）上验证。全部文件都在 `/data/bcproxy`，开机由 systemd 启动。首次安装（Git Bash，在 `~/.ssh/config` 里配好 `UCK-G2-Plus`）：
+
+```bash
+deploy/push.sh --with-config      # 复制代码、config.yaml、state/，下载 Python 和 ffmpeg，启动服务
+deploy/push.sh                    # 以后更新代码：不动设备上的配置和 state/
+```
+
+**每台摄像头一个 IP：** NVR 不支持同一 IP 的不同端口。`config.yaml` 里写 `alias_interface: eth0`，并给每台摄像头配 `listen: 192.168.0.5x:9000`，代理启动时把这些 IP 加到网卡上，运行中每 30 秒检查一次，丢失就补回并写入 `errors.log`。不改 `/etc/systemd/network/eth0.network`，这个文件由 UniFi OS 生成。这些 IP 要避开路由器的 DHCP 地址池。NVR 添加摄像头时填对应的 IP，端口 9000。
+
+**日志**（`/data/bcproxy/logs/`，自动轮转，每种最多 6 个 5 MB 的文件）：
+
+| 文件 | 内容 |
+|---|---|
+| `errors.log` | WARNING 及以上，排查问题先看这里 |
+| `bcproxy.log` | 全部日志，级别由 `log_level` 决定 |
+| `crash.log` | 致命信号时的 Python 调用栈，含看门狗杀进程时卡住的位置 |
+| `restarts.log` | 每次退出的原因：`result=watchdog`、`oom-kill`、`exit-code` 等 |
+
+RTSP 地址和 XML 里的密码写入前会替换成 `***`。
+
+**诊断上传：** UniFi OS 每小时把 `/persistent/report/` 里的报告传给 Ubiquiti，设备上任何进程崩溃时生成的报告都带完整的 `ps`。所以 ffmpeg 的 RTSP 地址（含密码）不放在命令行，而是放进 memfd 里的 ffconcat 文件。`LimitCORE=1` 让代理自己崩溃时不生成报告（0 不行，内核对管道型 `core_pattern` 不看 0）。
+
+常用命令：
+
+```bash
+systemctl status bcproxy
+tail -f /data/bcproxy/logs/errors.log
+journalctl -u bcproxy -b
+```
+
+**看门狗：** `Type=notify` + `WatchdogSec=60`。心跳在事件循环里发送，循环卡住 60 秒，或摄像头的后台任务（事件流等）异常退出，服务都会被重启。任何原因退出都在 10 秒后重启，且不限次数。
+
+**固件升级：** 升级时 `overlay_cleanup`（`/usr/share/initramfs-tools/scripts/ubnt-init/apq8053/boot-emmc`）会删除 `/usr`、`/lib`、`/var`（`var/log` 除外）和部分 `/etc`，保留 `/data` 和 `/etc/systemd/system` 里的服务文件。所以这里不用 apt，也不用固件自带的 Python。`ubnt-dpkg-restore` 只恢复官方白名单里的包，打成 deb 没有用。
+
+这份清单是固件脚本的一部分，以后可能变。升级后检查 `systemctl is-enabled bcproxy`；如果服务没了，运行下面的命令恢复，它不需要联网：
+
+```bash
+sh /data/bcproxy/app/deploy/install.sh
+```
+
+**恢复出厂设置会清空 `/data`**，只能重新运行 `deploy/push.sh --with-config`。`config.yaml` 要在 PC 上留一份；设备上的 `state/` 需要时自己备份。
+
 ## 事件映射
 
 | 海康 eventType | 目标 (detectionTarget) | Reolink msg 33 输出 |
@@ -28,6 +99,74 @@
 - 海康 `regionID`（从 1 开始）映射为 Reolink 区域编号 `zone`（从 0 开始）。
 - 越界这类单次脉冲告警会保持 `hold.smart` 秒，让 NVR 有时间触发录像；VMD 收到 `inactive` 时立即清除。
 - NVR 是否认为摄像头支持这些功能，取决于 msg 199 `<Support>` 中的 `<aitype>`（bit1=人, bit2=车, bit4=猫狗）和 `<smartAI>`（bit1=越界, bit2=入侵, bit3=徘徊）。这两个值根据配置里的 `ai_types` 和 `smart` 自动生成；msg 527/529/531 的区域列表也由配置生成。
+
+## 兼容性状态
+
+在真实 Reolink NVR 和 Reolink 手机 App 上测试过（海康 2688×1520 H.265 主码流 + 640×360 子码流）：
+
+| 功能 | 状态 | 说明 |
+|---|---|---|
+| 手动添加 / 登录 | ✅ 已验证 | FULL_AES（0x12）加密，回显 NVR 的包头 magic `0x0FEDCBA0` |
+| 实时预览（主 / 子码流） | ✅ 已验证 | NVR 和 App 都能看 |
+| 手机和 Reolink Client 下载录像 | ✅ 已验证 | 海康 H.265，包括多 tile 的摄像头，清晰和流畅都可以。见[海康 H.265 与 Reolink 下载](#海康-h265-与-reolink-下载) |
+| 摄像头改名 | ✅ 已验证 | 保存到 `state_dir`，并同步修改海康通道名称（`hik.sync_name`） |
+| AI / 智能侦测事件 | 🟡 代码完成 | msg 31/33；还需要在 NVR 上确认录像触发和图标显示 |
+| 码流设置页（56 / 146） | 🟡 待验证 | v7 补了 `videoEncType`，码率改为读取海康的实际配置 |
+| 码率 / CPU 占用 | 🟡 待 NVR 确认 | 122 回复 `<PerformanceInfo>`（`cpuUseRate`、`codeRate`、`netDataRate`），消息号和字段来自 Reolink Client 的 SDK；大华拿不到 CPU，显示 0 |
+| App 设置页 | 🟡 待验证 | 37 端口、42 邮件、46 移动侦测、52 隐私遮挡、76 网络、112 码流、120 在线用户、132 图像，格式按真机抓包 |
+| 码流分辨率 | 🟡 待 App 验证 | 146 列出海康提供的全部主码流分辨率（子码流和真机一样不可选）；57 写入后改海康的分辨率、帧率、码率并重连视频。App 发的 `videoEncType`、`encoderType` 不可信，不处理 |
+| 录像设置页 | 🟡 待 App 验证 | 81/82 ↔ 海康录像计划（Normal=CMR，其余类型=EDR），54/55 ↔ 覆盖、预录、延录 |
+| 高级网络设置页 | 🟡 待 App 验证 | 40/97/210/455，只保存在代理，不改海康网络 |
+| Tamper Alert | 🟡 待 App 验证 | 199 `aitype` 第 25 位声明能力，763/764 读写海康遮挡侦测开关；海康 `shelteralarm` 上报为 `tamper` |
+| 手动灯 | 🟡 待 App 验证 | 288 → 海康 supplementLight，`light_seconds`（默认 30 秒）后恢复原模式，291 推送状态 |
+| 声音 | 🟡 待 App 验证 | 主码流音频转码为 16 kHz AAC，随预览发送（仅预览；海康无喇叭，不支持对讲） |
+| Motion Boxes | 🟡 待 App 验证 | 只在实时预览，用相机自己的目标框，只在发这种数据的相机上生效。端到端验证到 Reolink Client 自己的解析器；屏幕显示和经 NVR 转发还没看到。详见下文 |
+| 回放 | 🟡 待验证 | 海康 SD 卡：ISAPI 录像搜索 + RTSP 回放（只播所选的一段，播完停止）→ 102/142/14/15/16/381/382，拖动 383；海康无存储时自动关闭。298 时间轴缩略图未实现 |
+| 局域网自动搜索 | 🟡 代码完成 | UDP 2000，回复格式按真机抓包；已确认 NVR 的搜索包能收到并回复，NVR“添加摄像头”列表中的显示还待确认 |
+| 其他消息 | ❌ 未知 | 110、113、122 等回空 200；257 回 400、789/818 回 405（与真机一致） |
+
+### 性能
+
+实测（2.0 Mbps 主码流）：解析和封装加密约 0.16% 单核，ffmpeg 转发约 2% 单核，音频转码约 1.6% 单核。CPU 不是瓶颈，首帧等待（1.3～2 秒）主要花在 RTSP 和 ffmpeg 分析上。`-fflags nobuffer`、小 `-probesize` 在主码流和回放上出不了画面，不要用。
+
+## 海康 H.265 与 Reolink 下载
+
+有些海康型号把每帧画面分成几个 tile，每个 tile 单独一个 slice：DS-2CD2347G1-L 和 DS-2CD2347G2-LU 的主码流是 3 个，G1 的子码流是 2 个。Reolink 自己的摄像头每帧只有 1 个 slice，Reolink 的部分代码处理不了更多。代理不重新编码，而是绕开这些问题：改写后的码流用 ffmpeg 解码，画面和原来逐帧相同（用 `framemd5` 核对过）。
+
+| 问题 | 后果 | 代理的处理 |
+|---|---|---|
+| VPS/SPS 声明 2 个时域子层（G1 关掉 SVC 也是这样） | NVR 的解码器改用 SVC 参考帧处理，P 帧解码失败 | 把 VPS/SPS 改写成单层（`hevcps.single_sub_layer`），只在没有参考帧集合保留多于 1 个短期参考帧时才改 |
+| VPS/SPS/PPS 超过 64 字节（含起始码）。G1 的 SPS 是 64 字节，H.265+ 下 81 字节 | Reolink 的 mp4 封装代码直接放弃：手机 App 提示下载错误，NVR 备份出空文件 | 去掉 SPS 里 VUI 的 HRD 参数（`hevcps.fit_mp4_limit`），变成 47 字节。解码用不到这些参数，摄像头也不发引用它们的 SEI |
+| 一个 GOP 用一次 `writev()` 写入，最多 600 片，每个 NAL 占 2 片，所以 GOP 帧数 × slice 数不能超过 300 | 整个 GOP 被丢掉（`v_io_count to big:600`），文件里几乎没有视频 | 统计每帧的 slice 数，在上限前 1 秒向摄像头请求关键帧（ISAPI `requestKeyFrame`，见 `StreamSource._guard_gop`） |
+
+Reolink 的 mp4 封装代码（`bc_mp4_*`）在手机 App、Reolink Client（`libBCSDKWrapper.dll`）和 NVR 的备份里都有。以上结论来自用 Windows 客户端里的这份代码转换代理发出的帧（帧用 `tools/bc_client.py --raw` 抓取）。
+
+- **关键帧的代价：** 多占硬盘。3 个 slice 时一个 GOP 最多 100 帧：25 fps 下约 3.2 秒，而 H.265+ 自己能拉到 10 秒。帧率低时，同样 100 帧持续更久（15 fps 下 6.7 秒）。本来就不超限的码流不受影响。只对支持 `requestKeyFrame` 的海康摄像头生效。
+- 修复之前录下的录像，手机仍然下载不了。NVR 不转码直接下载到 U 盘不受影响。
+
+## Motion Boxes
+
+**格式：** 框放在每个视频帧的扩展区里，由客户端自己绘制。布局见 `bcproxy/motionbox.py`，来自 NVR 主码流抓包，并直接调用 Reolink Client `libBCSDKWrapper` 里的帧解析函数核对过：同样的框，解析结果和真机帧只差我们自己选的分数和类别；没有框的帧，解析结果和真机完全相同。
+
+**开关：** Reolink Client 只要收到带这种数据的帧就会显示开关（`hasAiData` 会设置 `supportAiMark`），和 199 的能力位无关。所以相机发出第一个目标列表后，帧才带扩展区；从不发目标的相机不会出现开关。手机 App 的判断方式这里看不到。
+
+**框从哪来：** 只来自相机，代理上不做任何计算。Hik-Connect 画的框随网页预览的码流一起发：WebSocket 7681 端口（先取 `/ISAPI/Security/token`，再发 `realplay`），RTP 里的私有包（payload type 112），和录像里存的是同一种。包的布局见 `bcproxy/motionbox.py`。用一段同时存了两份框的录像核对过：压缩形式的 351 个列表全部和明文一致。画回录像自己的帧上，框都落在车上。
+
+这些地方没有：RTSP 只有视频和音频。它的 `isapi.metadata` 轨（在 `/ISAPI/Streaming/channels/101`）每个目标只有一个样本，告警里的 `TargetRect` 也只有一个样本。`httpPreview` 返回 403。
+
+| 相机 | 实时目标框 |
+|---|---|
+| BackDoor（DS-2CD2087G2-L） | ✅ 已看到，走子码流 |
+| MountainView（DS-2CD2347G2-LU） | ✅ 已看到。子码流返回 `deviceError`，所以读主码流 |
+| CameraTest、MainDoor、Backyard（DS-2CD2347G1-L） | ✅ 有人在 CameraTest 画面里走动时看到了，Backyard 也出现过一次，用的是它们自己的列表格式（主码流；子码流返回 `deviceError`）。没有画回帧上核对：这几台没有录像 |
+| Road（DS-2CD7526G0-IZHS） | ❌ 45 秒内没看到 |
+| Crossroad（DS-2CD4232FWD-IZH8） | ❌ 拿不到会话 token（HTTP 403） |
+| 大华 | ❌ 没有查，已关闭 |
+
+- **成本：** 有人观看时多一条到相机的连接，而 NVR 全天都在看。不解码：代理只读包头和目标列表。BackDoor 子码流约 330 kbps；回退到主码流的相机，会把整路主码流发到代理。Cloud Key 上的 CPU 占用还没测。
+- **依赖：** 相机的 WebSocket 服务要开着。用 `motion_boxes: false` 关闭此功能。
+- **延迟：** 框和视频走不同的连接，没有逐帧对齐。
+- **没有覆盖：** 回放还没有框。`ISAPI/ContentMgmt/download` 能拿到录像里同样的包，可以从这里开始。
 
 ## 大华摄像头
 
@@ -99,19 +238,9 @@ NVR 需要的两点：
 - `getStatus` 的 `MoveStatus` 在转到预置点时会过早显示 Idle，判断到位要看位置是否稳定。
 - 摄像头自己的归位任务（PtzAutoMovement）不受代理控制，可能在 App 操作后把画面转回去。
 
-## 快速开始
+## 开发
 
-```bash
-pip install -r requirements.txt        # cryptography + PyYAML；另需 ffmpeg/ffprobe
-cp config.example.yaml config.yaml     # 填海康地址/账号/RTSP、虚拟摄像头的 IP 和密码
-python -m bcproxy -c config.yaml -v
-```
-
-然后在 Reolink NVR 中手动添加摄像头：填 `listen` 中的 IP，端口 9000，用户名和密码与配置中的 `username` / `password` 一致。
-
-**一台海康对应一个 IP**：NVR 按 IP 区分摄像头。Linux 上可以给代理主机加别名 IP（`ip addr add 192.168.1.201/24 dev eth0`），或用 Docker macvlan；Windows 的做法见下文。
-
-## 不连 NVR 的本地验证
+### 不连 NVR 的本地验证
 
 ```bash
 # 终端 1：假海康（Digest 认证 + alertStream + 抓图），可交互输入事件：vmd human / line 1 vehicle / field 2 human
@@ -125,33 +254,51 @@ python tools/bc_client.py 127.0.0.1 -p change-me --preview subStream --out sub.h
 
 大华用 `python tools/fake_dahua.py --port 8081`（账号 `admin` / `dahua12345`），可输入 `motion`、`human`、`human off`、`line 1 Human`、`region 2 Vehicle`、`blind`。
 
-## 兼容性状态
+### 用真机数据补全未适配的消息
 
-在真实 Reolink NVR 和 Reolink 手机 App 上测试过（海康 2688×1520 H.265 主码流 + 640×360 子码流）：
+1. 用真 Reolink 摄像头导出回复：
+   `python tools/bc_client.py <真机IP> -p <密码> --dump-templates captured/ --get 26 46 56 76 110 112 113 122 132 146 208`
+   加上 `--nvr-magic` 可以模拟 NVR 的包头。
+2. 或者在 NVR 和真机之间抓包，然后解密：
+   `python tools/bc_dump.py nvr.pcap -p <摄像头密码> --templates captured/`
+   手机 App 不方便抓包时，可以用中继：`python tools/bc_relay.py <真机IP> --listen 0.0.0.0:9001 --out app.pcap`，然后在 App 里用 IP 添加“本机IP:9001”，再用 bc_dump.py 解密 `app.pcap`。
+3. `captured/<id>.xml` 会优先于内置模板使用，型号、UID 等字段可以改成 `${model}`、`${uid}` 这样的占位符。
+4. 代理开启 `trace: true` 时，日志里的 `unhandled msg N` 就是还缺模板的消息。每个连接里同一个 ID 只警告一次。
 
-| 功能 | 状态 | 说明 |
-|---|---|---|
-| 手动添加 / 登录 | ✅ 已验证 | FULL_AES（0x12）加密，回显 NVR 的包头 magic `0x0FEDCBA0` |
-| 实时预览（主 / 子码流） | ✅ 已验证 | NVR 和 App 都能看 |
-| 摄像头改名 | ✅ 已验证 | 保存到 `state_dir`，并同步修改海康通道名称（`hik.sync_name`） |
-| AI / 智能侦测事件 | 🟡 代码完成 | msg 31/33；还需要在 NVR 上确认录像触发和图标显示 |
-| 码流设置页（56 / 146） | 🟡 待验证 | v7 补了 `videoEncType`，码率改为读取海康的实际配置 |
-| 码率 / CPU 占用 | 🟡 待 NVR 确认 | 122 回复 `<PerformanceInfo>`（`cpuUseRate`、`codeRate`、`netDataRate`），消息号和字段来自 Reolink Client 的 SDK；大华拿不到 CPU，显示 0 |
-| App 设置页 | 🟡 待验证 | 37 端口、42 邮件、46 移动侦测、52 隐私遮挡、76 网络、112 码流、120 在线用户、132 图像，格式按真机抓包 |
-| 码流分辨率 | 🟡 待 App 验证 | 146 列出海康提供的全部主码流分辨率（子码流和真机一样不可选）；57 写入后改海康的分辨率、帧率、码率并重连视频。App 发的 `videoEncType`、`encoderType` 不可信，不处理 |
-| 录像设置页 | 🟡 待 App 验证 | 81/82 ↔ 海康录像计划（Normal=CMR，其余类型=EDR），54/55 ↔ 覆盖、预录、延录 |
-| 高级网络设置页 | 🟡 待 App 验证 | 40/97/210/455，只保存在代理，不改海康网络 |
-| Tamper Alert | 🟡 待 App 验证 | 199 `aitype` 第 25 位声明能力，763/764 读写海康遮挡侦测开关；海康 `shelteralarm` 上报为 `tamper` |
-| 手动灯 | 🟡 待 App 验证 | 288 → 海康 supplementLight，`light_seconds`（默认 30 秒）后恢复原模式，291 推送状态 |
-| 声音 | 🟡 待 App 验证 | 主码流音频转码为 16 kHz AAC，随预览发送（仅预览；海康无喇叭，不支持对讲） |
-| Motion Boxes | 🟡 待 App 验证 | 只在实时预览，用相机自己的目标框，只在发这种数据的相机上生效。端到端验证到 Reolink Client 自己的解析器；屏幕显示和经 NVR 转发还没看到。详见下文 |
-| 回放 | 🟡 待验证 | 海康 SD 卡：ISAPI 录像搜索 + RTSP 回放（只播所选的一段，播完停止）→ 102/142/14/15/16/381/382，拖动 383；海康无存储时自动关闭。298 时间轴缩略图未实现 |
-| 局域网自动搜索 | 🟡 代码完成 | UDP 2000，回复格式按真机抓包；已确认 NVR 的搜索包能收到并回复，NVR“添加摄像头”列表中的显示还待确认 |
-| 其他消息 | ❌ 未知 | 110、113、122 等回空 200；257 回 400、789/818 回 405（与真机一致） |
+### 文件结构
 
-### 性能
+```
+bcproxy/
+  crypto.py     BCEncrypt XOR / AES-128-CFB，登录哈希和密钥派生
+  bc.py         Baichuan 帧编解码（头部、magic、扩展 XML、二进制模式、FULL_AES）
+  bcmedia.py    BcMedia 容器（InfoV2 / I 帧 / P 帧 / AAC），Annex-B 访问单元切分
+  hevcps.py     H.265 VPS/SPS 改写（给 NVR 和 Reolink 的 mp4 封装代码）
+  session.py    服务端会话：登录协商、模板应答、设置写入、告警订阅(31/33)、预览(3/4)、抓图(109)
+  camera.py     虚拟摄像头：海康事件 → 状态机 → 推送；能力位、改名、海康状态轮询
+  discovery.py  局域网搜索应答（UDP 2000 → 3000）
+  hikcfg.py     写到海康的设置：码流、录像计划、灯光
+  dahua.py      大华：事件流、配置表、SD 卡录像（接口和 hik/hikcfg/HikRecordings 对应）
+  playback.py   回放：录像搜索、事件标签、回放流
+  settings.py   NVR/App 写入设置的合并与持久化
+  events.py     事件状态机 + <AlarmEventList> 生成
+  hik.py        ISAPI：Digest 认证、alertStream、multipart 解析、告警映射、HTTP 推送接收
+  media.py      ffprobe/ffmpeg 拉 RTSP，多观看者共享一个 ffmpeg，码率统计，为缩短 GOP 请求关键帧
+  logsetup.py   控制台和轮转日志文件，写入前去掉密码
+  watchdog.py   systemd 就绪通知和看门狗心跳，检查后台任务是否还活着
+  netalias.py   把摄像头的 listen IP 加到网卡上并保持
+  templates/    内置回复模板（可被 templates_dir 覆盖）
+deploy/         Cloud Key 部署：systemd 服务、设备上的安装脚本、PC 上的推送脚本
+tools/
+  bc_client.py  Baichuan 客户端（测试代理 / 从真机导出模板 / --raw 保存原始帧）
+  bc_dump.py    pcap/pcapng 解密工具
+  bc_discover.py 局域网搜索（列出真机和虚拟摄像头）
+  bc_relay.py   App/NVR 与真机之间的录制中继（输出 pcap，交给 bc_dump.py 解密）
+  fake_hik.py   假海康 ISAPI 服务
+  fake_dahua.py 假大华 CGI 服务（含 PTZ）
+tests/          协议测试（使用 neolink 的真机样本）+ 端到端测试：python -m pytest
+```
 
-实测（2.0 Mbps 主码流）：解析和封装加密约 0.16% 单核，ffmpeg 转发约 2% 单核，音频转码约 1.6% 单核。CPU 不是瓶颈，首帧等待（1.3～2 秒）主要花在 RTSP 和 ffmpeg 分析上。`-fflags nobuffer`、小 `-probesize` 在主码流和回放上出不了画面，不要用。
+## 技术细节
 
 ### ffmpeg 卡死
 
@@ -161,30 +308,6 @@ python tools/bc_client.py 127.0.0.1 -p change-me --preview subStream --out sub.h
 ### TODO：回放拖动
 
 拖动进度条还有问题（App 上的具体表现待整理）。383 的回复格式是推断的，没有真机样本；真机上拖动时的抓包还没拿到。录像列表为了不超过单条消息上限会合并片段，拖到合并产生的空档会落到下一段真实录像。
-
-### Motion Boxes
-
-**格式：** 框放在每个视频帧的扩展区里，由客户端自己绘制。布局见 `bcproxy/motionbox.py`，来自 NVR 主码流抓包，并直接调用 Reolink Client `libBCSDKWrapper` 里的帧解析函数核对过：同样的框，解析结果和真机帧只差我们自己选的分数和类别；没有框的帧，解析结果和真机完全相同。
-
-**开关：** Reolink Client 只要收到带这种数据的帧就会显示开关（`hasAiData` 会设置 `supportAiMark`），和 199 的能力位无关。所以相机发出第一个目标列表后，帧才带扩展区；从不发目标的相机不会出现开关。手机 App 的判断方式这里看不到。
-
-**框从哪来：** 只来自相机，代理上不做任何计算。Hik-Connect 画的框随网页预览的码流一起发：WebSocket 7681 端口（先取 `/ISAPI/Security/token`，再发 `realplay`），RTP 里的私有包（payload type 112），和录像里存的是同一种。包的布局见 `bcproxy/motionbox.py`。用一段同时存了两份框的录像核对过：压缩形式的 351 个列表全部和明文一致。画回录像自己的帧上，框都落在车上。
-
-这些地方没有：RTSP 只有视频和音频。它的 `isapi.metadata` 轨（在 `/ISAPI/Streaming/channels/101`）每个目标只有一个样本，告警里的 `TargetRect` 也只有一个样本。`httpPreview` 返回 403。
-
-| 相机 | 实时目标框 |
-|---|---|
-| BackDoor（DS-2CD2087G2-L） | ✅ 已看到，走子码流 |
-| MountainView（DS-2CD2347G2-LU） | ✅ 已看到。子码流返回 `deviceError`，所以读主码流 |
-| CameraTest、MainDoor、Backyard（DS-2CD2347G1-L） | ✅ 有人在 CameraTest 画面里走动时看到了，Backyard 也出现过一次，用的是它们自己的列表格式（主码流；子码流返回 `deviceError`）。没有画回帧上核对：这几台没有录像 |
-| Road（DS-2CD7526G0-IZHS） | ❌ 45 秒内没看到 |
-| Crossroad（DS-2CD4232FWD-IZH8） | ❌ 拿不到会话 token（HTTP 403） |
-| 大华 | ❌ 没有查，已关闭 |
-
-- **成本：** 有人观看时多一条到相机的连接，而 NVR 全天都在看。不解码：代理只读包头和目标列表。BackDoor 子码流约 330 kbps；回退到主码流的相机，会把整路主码流发到代理。Cloud Key 上的 CPU 占用还没测。
-- **依赖：** 相机的 WebSocket 服务要开着。用 `motion_boxes: false` 关闭此功能。
-- **延迟：** 框和视频走不同的连接，没有逐帧对齐。
-- **没有覆盖：** 回放还没有框。`ISAPI/ContentMgmt/download` 能拿到录像里同样的包，可以从这里开始。
 
 ### 协议上踩过的坑
 
@@ -205,104 +328,7 @@ python tools/bc_client.py 127.0.0.1 -p change-me --preview subStream --out sub.h
 - **加密**：NVR 请求 FULL_AES（`0xdc12`），降级到 AES（0x02）会被直接断开。二进制载荷（视频、JPEG）整段加密，扩展头里带 `<encryptLen>`。真机还会带 `checkPos/checkValue`，并且只加密前 1024 字节；我们不这么做，NVR 和 App 也能正常解码。
 - **局域网搜索**：NVR 每 2 秒从 UDP 3000 向 `255.255.255.255:2000` 广播 4 字节 `aa aa 00 00`，Reolink Client 也这样搜索。设备回复一个 388 字节的定长结构（IP、端口、名称、MAC、UID，字段偏移见 `bcproxy/discovery.py`）。回复**固定发到对方的 UDP 3000**，与请求的源端口无关。代理在 `0.0.0.0:2000` 上监听，每收到一次搜索，就为每台虚拟摄像头各回一个包。`tools/bc_discover.py` 可以列出局域网里的真机和虚拟摄像头。
 - **设置消息**：NVR/App 写入的设置（25/45/57/105/209/297，以及“读 N、写 N+1”这种配对）会合并到对应的读取回复里，保存到 `state_dir/<camera>/<id>.xml`，删掉文件即可恢复默认。
-
-## Windows 上运行
-
-- `listen` 中的 IP 必须是本机网卡上已有的地址。要加别名 IP，网卡需要先改成静态 IP，再执行
-  `netsh interface ipv4 add address "以太网" 192.168.0.201 255.255.255.0`。
-- 9000 端口可能被 Hyper-V / WSL / Docker 保留（绑定报 `could not bind`）。用 `netsh interface ipv4 show excludedportrange protocol=tcp` 检查；如果被保留，就先 `net stop winnat`，再执行 `netsh int ipv4 add excludedportrange protocol=tcp startport=9000 numberofports=1`，最后 `net start winnat`。
-- 防火墙放行入站 TCP 9000 和 UDP 2000（局域网搜索）：
-  `New-NetFirewallRule -DisplayName "bcproxy 9000" -Direction Inbound -Protocol TCP -LocalPort 9000 -Action Allow`
-  `New-NetFirewallRule -DisplayName "bcproxy search" -Direction Inbound -Protocol UDP -LocalPort 2000 -Action Allow`
-- 本机运行 Reolink Client 时，它会占用 UDP 3000，此时 `tools/bc_discover.py` 无法运行（代理本身不受影响）。
-- 保存完整日志：`python -m bcproxy -c config.yaml -v *> log.txt`
-
-## 部署到 UniFi Cloud Key Gen2 Plus
-
-在 UCK-G2-Plus（UniFi OS 6.0.11，Debian 13，aarch64）上验证。全部文件都在 `/data/bcproxy`，开机由 systemd 启动。首次安装（Git Bash，在 `~/.ssh/config` 里配好 `UCK-G2-Plus`）：
-
-```bash
-deploy/push.sh --with-config      # 复制代码、config.yaml、state/，下载 Python 和 ffmpeg，启动服务
-deploy/push.sh                    # 以后更新代码：不动设备上的配置和 state/
-```
-
-**每台摄像头一个 IP：** NVR 不支持同一 IP 的不同端口。`config.yaml` 里写 `alias_interface: eth0`，并给每台摄像头配 `listen: 192.168.0.5x:9000`，代理启动时把这些 IP 加到网卡上，运行中每 30 秒检查一次，丢失就补回并写入 `errors.log`。不改 `/etc/systemd/network/eth0.network`，这个文件由 UniFi OS 生成。这些 IP 要避开路由器的 DHCP 地址池。NVR 添加摄像头时填对应的 IP，端口 9000。
-
-**日志**（`/data/bcproxy/logs/`，自动轮转，每种最多 6 个 5 MB 的文件）：
-
-| 文件 | 内容 |
-|---|---|
-| `errors.log` | WARNING 及以上，排查问题先看这里 |
-| `bcproxy.log` | 全部日志，级别由 `log_level` 决定 |
-| `crash.log` | 致命信号时的 Python 调用栈，含看门狗杀进程时卡住的位置 |
-| `restarts.log` | 每次退出的原因：`result=watchdog`、`oom-kill`、`exit-code` 等 |
-
-RTSP 地址和 XML 里的密码写入前会替换成 `***`。
-
-**诊断上传：** UniFi OS 每小时把 `/persistent/report/` 里的报告传给 Ubiquiti，设备上任何进程崩溃时生成的报告都带完整的 `ps`。所以 ffmpeg 的 RTSP 地址（含密码）不放在命令行，而是放进 memfd 里的 ffconcat 文件。`LimitCORE=1` 让代理自己崩溃时不生成报告（0 不行，内核对管道型 `core_pattern` 不看 0）。
-
-常用命令：
-
-```bash
-systemctl status bcproxy
-tail -f /data/bcproxy/logs/errors.log
-journalctl -u bcproxy -b
-```
-
-**看门狗：** `Type=notify` + `WatchdogSec=60`。心跳在事件循环里发送，循环卡住 60 秒，或摄像头的后台任务（事件流等）异常退出，服务都会被重启。任何原因退出都在 10 秒后重启，且不限次数。
-
-**固件升级：** 升级时 `overlay_cleanup`（`/usr/share/initramfs-tools/scripts/ubnt-init/apq8053/boot-emmc`）会删除 `/usr`、`/lib`、`/var`（`var/log` 除外）和部分 `/etc`，保留 `/data` 和 `/etc/systemd/system` 里的服务文件。所以这里不用 apt，也不用固件自带的 Python。`ubnt-dpkg-restore` 只恢复官方白名单里的包，打成 deb 没有用。
-
-这份清单是固件脚本的一部分，以后可能变。升级后检查 `systemctl is-enabled bcproxy`；如果服务没了，运行下面的命令恢复，它不需要联网：
-
-```bash
-sh /data/bcproxy/app/deploy/install.sh
-```
-
-**恢复出厂设置会清空 `/data`**，只能重新运行 `deploy/push.sh --with-config`。`config.yaml` 要在 PC 上留一份；设备上的 `state/` 需要时自己备份。
-
-## 用真机数据补全未适配的消息
-
-1. 用真 Reolink 摄像头导出回复：
-   `python tools/bc_client.py <真机IP> -p <密码> --dump-templates captured/ --get 26 46 56 76 110 112 113 122 132 146 208`
-   加上 `--nvr-magic` 可以模拟 NVR 的包头。
-2. 或者在 NVR 和真机之间抓包，然后解密：
-   `python tools/bc_dump.py nvr.pcap -p <摄像头密码> --templates captured/`
-   手机 App 不方便抓包时，可以用中继：`python tools/bc_relay.py <真机IP> --listen 0.0.0.0:9001 --out app.pcap`，然后在 App 里用 IP 添加“本机IP:9001”，再用 bc_dump.py 解密 `app.pcap`。
-3. `captured/<id>.xml` 会优先于内置模板使用，型号、UID 等字段可以改成 `${model}`、`${uid}` 这样的占位符。
-4. 代理开启 `trace: true` 时，日志里的 `unhandled msg N` 就是还缺模板的消息。每个连接里同一个 ID 只警告一次。
-
-## 文件结构
-
-```
-bcproxy/
-  crypto.py     BCEncrypt XOR / AES-128-CFB，登录哈希和密钥派生
-  bc.py         Baichuan 帧编解码（头部、magic、扩展 XML、二进制模式、FULL_AES）
-  bcmedia.py    BcMedia 容器（InfoV2 / I 帧 / P 帧 / AAC），Annex-B 访问单元切分
-  session.py    服务端会话：登录协商、模板应答、设置写入、告警订阅(31/33)、预览(3/4)、抓图(109)
-  camera.py     虚拟摄像头：海康事件 → 状态机 → 推送；能力位、改名、海康状态轮询
-  discovery.py  局域网搜索应答（UDP 2000 → 3000）
-  hikcfg.py     写到海康的设置：码流、录像计划、灯光
-  dahua.py      大华：事件流、配置表、SD 卡录像（接口和 hik/hikcfg/HikRecordings 对应）
-  playback.py   回放：录像搜索、事件标签、回放流
-  settings.py   NVR/App 写入设置的合并与持久化
-  events.py     事件状态机 + <AlarmEventList> 生成
-  hik.py        ISAPI：Digest 认证、alertStream、multipart 解析、告警映射、HTTP 推送接收
-  media.py      ffprobe/ffmpeg 拉 RTSP，多观看者共享一个 ffmpeg，码率统计
-  logsetup.py   控制台和轮转日志文件，写入前去掉密码
-  watchdog.py   systemd 就绪通知和看门狗心跳，检查后台任务是否还活着
-  netalias.py   把摄像头的 listen IP 加到网卡上并保持
-  templates/    内置回复模板（可被 templates_dir 覆盖）
-deploy/         Cloud Key 部署：systemd 服务、设备上的安装脚本、PC 上的推送脚本
-tools/
-  bc_client.py  Baichuan 客户端（测试代理 / 从真机导出模板）
-  bc_dump.py    pcap/pcapng 解密工具
-  bc_discover.py 局域网搜索（列出真机和虚拟摄像头）
-  bc_relay.py   App/NVR 与真机之间的录制中继（输出 pcap，交给 bc_dump.py 解密）
-  fake_hik.py   假海康 ISAPI 服务
-  fake_dahua.py 假大华 CGI 服务（含 PTZ）
-tests/          协议测试（使用 neolink 的真机样本）+ 端到端测试：python -m pytest
-```
+- **实时预览的帧时间**：帧时间一旦倒退，Reolink App 的实时预览就会永久卡住。帧时间用设备开机以来的微秒数，和真机一样：低 32 位放在 `micros`，高位放在帧头最后一个字段（真机在这里发 0x1、0x47）。以前低 32 位每 71.6 分钟回绕一次，预览就会卡住。测试时可以用 `debug_wrap_in`（秒）把下一次回绕提前到这么久之后。
 
 ## 其他限制
 

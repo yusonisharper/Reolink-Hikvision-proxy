@@ -12,6 +12,77 @@ Hikvision IPC ──ISAPI alertStream / HTTP push──┐
               ──ISAPI snapshot─────────────────┘
 ```
 
+Contents: [Getting started](#getting-started) · [Event mapping](#event-mapping) · [Compatibility status](#compatibility-status) · [Hikvision H.265 and Reolink downloads](#hikvision-h265-and-reolink-downloads) · [Motion Boxes](#motion-boxes) · [Dahua cameras](#dahua-cameras) · [Development](#development) · [Technical notes](#technical-notes)
+
+## Getting started
+
+### Quick start
+
+```bash
+pip install -r requirements.txt        # cryptography + PyYAML; ffmpeg/ffprobe are also required
+cp config.example.yaml config.yaml     # fill in Hikvision address/account/RTSP, the virtual camera's IP and password
+python -m bcproxy -c config.yaml -v
+```
+
+Then add the camera manually in the Reolink NVR: use the IP from `listen`, port 9000, and the `username` and `password` from the config.
+
+**One IP per Hikvision camera:** The NVR tells cameras apart by IP. On Linux, add alias IPs to the proxy host (`ip addr add 192.168.1.201/24 dev eth0`) or use Docker macvlan. For Windows, see below.
+
+### Running on Windows
+
+- The IP in `listen` must already exist on a local network adapter. To add an alias IP, first switch the adapter to a static IP, then run
+  `netsh interface ipv4 add address "Ethernet" 192.168.0.201 255.255.255.0`.
+- Port 9000 may be reserved by Hyper-V, WSL or Docker (binding fails with `could not bind`). Check with `netsh interface ipv4 show excludedportrange protocol=tcp`. If it is reserved, run `net stop winnat`, then `netsh int ipv4 add excludedportrange protocol=tcp startport=9000 numberofports=1`, and finally `net start winnat`.
+- Allow inbound TCP 9000 and UDP 2000 (LAN discovery) through the firewall:
+  `New-NetFirewallRule -DisplayName "bcproxy 9000" -Direction Inbound -Protocol TCP -LocalPort 9000 -Action Allow`
+  `New-NetFirewallRule -DisplayName "bcproxy search" -Direction Inbound -Protocol UDP -LocalPort 2000 -Action Allow`
+- While Reolink Client runs on the same machine, it holds UDP 3000, and `tools/bc_discover.py` cannot run (the proxy itself is not affected).
+- To save the full log: `python -m bcproxy -c config.yaml -v *> log.txt`
+
+### Deploying to a UniFi Cloud Key Gen2 Plus
+
+Verified on a UCK-G2-Plus (UniFi OS 6.0.11, Debian 13, aarch64). All files live in `/data/bcproxy`, and systemd starts the service at boot. First install (Git Bash, with `UCK-G2-Plus` set up in `~/.ssh/config`):
+
+```bash
+deploy/push.sh --with-config      # copies code, config.yaml and state/, downloads Python and ffmpeg, starts the service
+deploy/push.sh                    # later code updates: leaves the device's config and state/ alone
+```
+
+**One IP per camera:** An NVR does not accept different ports on one IP. Put `alias_interface: eth0` in `config.yaml` and give each camera `listen: 192.168.0.5x:9000`. The proxy adds these IPs to the interface at startup, checks them every 30 seconds while running, and adds back any that are lost, with a line in `errors.log`. `/etc/systemd/network/eth0.network` is not changed, because UniFi OS generates that file. Keep these IPs out of the router's DHCP pool. When adding a camera to the NVR, use its IP and port 9000.
+
+**Logs** (`/data/bcproxy/logs/`, rotated, at most 6 files of 5 MB each):
+
+| File | Content |
+|---|---|
+| `errors.log` | WARNING and up; look here first |
+| `bcproxy.log` | Everything, at the level set by `log_level` |
+| `crash.log` | Python stacks from a fatal signal, including where a process killed by the watchdog was stuck |
+| `restarts.log` | The reason for each exit: `result=watchdog`, `oom-kill`, `exit-code` and so on |
+
+Passwords in RTSP URLs and XML are replaced with `***` before writing.
+
+**Diagnostics upload:** UniFi OS uploads the reports in `/persistent/report/` to Ubiquiti every hour, and the report from any process crashing on the device includes the full `ps` output. So ffmpeg's RTSP URL (with its password) is not on the command line, but in an ffconcat file in a memfd. `LimitCORE=1` keeps the proxy's own crashes from creating reports (0 won't do: the kernel ignores 0 for a piped `core_pattern`).
+
+Useful commands:
+
+```bash
+systemctl status bcproxy
+tail -f /data/bcproxy/logs/errors.log
+journalctl -u bcproxy -b
+```
+
+**Watchdog:** `Type=notify` + `WatchdogSec=60`. The heartbeat is sent from the event loop, so the service restarts when the loop hangs for 60 seconds or when a camera's background task (such as its event stream) dies. Whatever the reason for an exit, the service restarts after 10 seconds, with no limit on restarts.
+
+**Firmware updates:** An update runs `overlay_cleanup` (`/usr/share/initramfs-tools/scripts/ubnt-init/apq8053/boot-emmc`), which removes `/usr`, `/lib`, `/var` (except `var/log`) and parts of `/etc`, and keeps `/data` and the service files in `/etc/systemd/system`. That is why this doesn't use apt or the firmware's Python. `ubnt-dpkg-restore` only restores packages on the official whitelist, so packaging this as a deb would not help.
+
+This list is part of the firmware's script and may change. After an update, check `systemctl is-enabled bcproxy`. If the service is gone, restore it with the following command, which needs no network:
+
+```bash
+sh /data/bcproxy/app/deploy/install.sh
+```
+
+**A factory reset wipes `/data`**, and then the only way back is to run `deploy/push.sh --with-config` again. Keep a copy of `config.yaml` on the PC, and back up the device's `state/` if you need it.
+
 ## Event mapping
 
 | Hikvision eventType | Target (detectionTarget) | Reolink msg 33 output |
@@ -28,6 +99,74 @@ Hikvision IPC ──ISAPI alertStream / HTTP push──┐
 - Hikvision's `regionID` (from 1) maps to the Reolink zone number `zone` (from 0).
 - One-shot alerts such as line crossing are held for `hold.smart` seconds, so the NVR has time to start recording; VMD clears immediately on `inactive`.
 - Whether the NVR considers a camera capable of these features depends on `<aitype>` (bit 1 = people, bit 2 = vehicle, bit 4 = dog/cat) and `<smartAI>` (bit 1 = line crossing, bit 2 = intrusion, bit 3 = loitering) in `<Support>` of msg 199. Both values are generated from `ai_types` and `smart` in the config, and so are the zone lists of msg 527/529/531.
+
+## Compatibility status
+
+Tested on a real Reolink NVR and the Reolink mobile app (Hikvision 2688×1520 H.265 main stream + 640×360 sub stream):
+
+| Feature | Status | Notes |
+|---|---|---|
+| Manual add / login | ✅ Verified | FULL_AES (0x12) encryption, echoes the NVR's header magic `0x0FEDCBA0` |
+| Live preview (main/sub) | ✅ Verified | Works on both NVR and app |
+| Downloads to the phone and Reolink Client | ✅ Verified | Hikvision H.265, tiled cameras included, clear and fluent. See [Hikvision H.265 and Reolink downloads](#hikvision-h265-and-reolink-downloads) |
+| Renaming a camera | ✅ Verified | Saved to `state_dir` and synced to the Hikvision channel name (`hik.sync_name`) |
+| AI and smart detection events | 🟡 Code done | msg 31/33; recording triggers and icons still to be confirmed on the NVR |
+| Stream settings page (56 / 146) | 🟡 To verify | v7 added `videoEncType`; bitrate now reads Hikvision's actual config |
+| Bitrate / CPU usage | 🟡 To confirm on the NVR | 122 answers `<PerformanceInfo>` (`cpuUseRate`, `codeRate`, `netDataRate`); message id and fields come from Reolink Client's SDK; Dahua has no CPU value and shows 0 |
+| App settings pages | 🟡 To verify | 37 ports, 42 email, 46 motion detection, 52 privacy mask, 76 network, 112 streams, 120 online users, 132 image; formats follow real captures |
+| Stream resolution | 🟡 To verify in the app | 146 lists all main stream resolutions Hikvision offers (the sub stream is fixed, as on real cameras); writing 57 changes Hikvision's resolution, frame rate and bitrate and reconnects the video. The app's `videoEncType` and `encoderType` are unreliable and ignored |
+| Recording settings page | 🟡 To verify in the app | 81/82 ↔ Hikvision's recording schedule (Normal = CMR, other types = EDR), 54/55 ↔ overwrite, pre-record, post-record |
+| Advanced network settings page | 🟡 To verify in the app | 40/97/210/455, only stored in the proxy, Hikvision's network is not changed |
+| Tamper Alert | 🟡 To verify in the app | Bit 25 of `aitype` in 199 declares it, 763/764 read and write Hikvision's tamper detection switch; Hikvision's `shelteralarm` is reported as `tamper` |
+| Manual light | 🟡 To verify in the app | 288 → Hikvision supplementLight, back to the previous mode after `light_seconds` (default 30 s), 291 pushes the state |
+| Audio | 🟡 To verify in the app | Main stream audio is transcoded to 16 kHz AAC and sent with the preview (preview only; Hikvision has no speaker here, so no two-way audio) |
+| Motion Boxes | 🟡 To verify in the app | Live preview only, with the camera's own target boxes, on the cameras that send them. Checked end to end up to Reolink Client's own parser; drawing on screen and passing through the NVR are not yet seen. See below |
+| Playback | 🟡 To verify | Hikvision SD card: ISAPI recording search + RTSP playback (only the selected clip, stops at its end) → 102/142/14/15/16/381/382, seeking 383; off automatically when Hikvision has no storage. 298 timeline thumbnails are not implemented |
+| LAN discovery | 🟡 Code done | UDP 2000, reply format follows real captures; the NVR's search packets are confirmed received and answered, display in the NVR's "add camera" list still to be confirmed |
+| Other messages | ❌ Unknown | 110, 113, 122 etc. answer an empty 200; 257 answers 400, 789/818 answer 405 (same as a real camera) |
+
+### Performance
+
+Measured (2.0 Mbps main stream): parsing, packaging and encryption about 0.16% of one core, ffmpeg forwarding about 2%, audio transcoding about 1.6%. CPU is not the bottleneck. The wait for the first frame (1.3–2 s) is mostly RTSP and ffmpeg's analysis. `-fflags nobuffer` and a small `-probesize` give no picture on the main stream and in playback, so don't use them.
+
+## Hikvision H.265 and Reolink downloads
+
+Some Hikvision models code each picture as several tiles, each in its own slice: DS-2CD2347G1-L and DS-2CD2347G2-LU have 3 on the main stream, and the G1's sub stream has 2. Reolink's own cameras send one slice per picture, and some of Reolink's code does not cope with more. The proxy works around this without re-encoding: ffmpeg decodes the rewritten streams to the same pictures (checked with `framemd5`).
+
+| Problem | Effect | What the proxy does |
+|---|---|---|
+| VPS/SPS declare 2 temporal sub-layers (G1, even with SVC off) | The NVR's decoder switches to its SVC reference handling and fails on the P frames | Rewrites the VPS/SPS to one sub-layer (`hevcps.single_sub_layer`), only when no reference picture set keeps more than one short-term picture |
+| A VPS/SPS/PPS longer than 64 bytes, start code included (G1 SPS: 64 bytes, 81 with H.265+) | Reolink's mp4 writer gives up: the phone app reports a download error, NVR backups are empty | Drops the VUI HRD parameters from the SPS (`hevcps.fit_mp4_limit`), which gives 47 bytes. Decoders don't use them, and the camera sends no SEI that refers to them |
+| A GOP is written with one `writev()` of at most 600 pieces, two per NAL unit, so pictures per GOP × slices must stay at or below 300 | The writer drops the whole GOP (`v_io_count to big:600`), and the file holds little or no video | Counts the slices per picture and asks the camera for a keyframe (ISAPI `requestKeyFrame`) one second before the limit (`StreamSource._guard_gop`) |
+
+Reolink's mp4 writer (`bc_mp4_*`) runs in the phone app, in Reolink Client (`libBCSDKWrapper.dll`) and in the NVR's backup. The findings come from running the Windows client's copy on frames captured from the proxy (`tools/bc_client.py --raw`).
+
+- **Cost of the keyframes:** More storage. With 3 slices a GOP holds at most 100 pictures: about 3.2 s at 25 fps, where H.265+ makes up to 10 s. At a lower frame rate the same 100 pictures last longer (6.7 s at 15 fps). Streams that stay below the limit by themselves are left alone. Only Hikvision cameras that accept `requestKeyFrame` are covered.
+- Recordings made before these fixes still fail to download to the phone. NVR downloads to USB without transcoding were not affected.
+
+## Motion Boxes
+
+**Format:** The boxes travel in the extension area of each video frame, and the client draws them itself. The layout is in `bcproxy/motionbox.py`, from an NVR main stream capture and checked by calling the frame parser in Reolink Client's `libBCSDKWrapper` directly: for the same boxes, its result differs from a real frame's only in the score and class we choose, and a frame without boxes gives the same result as a real one.
+
+**The switch:** Reolink Client shows it once a frame carries this data (`hasAiData` sets `supportAiMark`). No capability bit in 199 is involved. So frames carry the extension only after the camera has sent its first target list, and a camera that sends none shows no option. The mobile app's check is not visible from here.
+
+**Where the boxes come from:** Only from the camera; nothing is computed on the proxy. What Hik-Connect draws comes with the stream of the web preview: a WebSocket on port 7681 (`/ISAPI/Security/token`, then `realplay`), RTP with private packets of payload type 112, the same ones stored in recordings. The packet layout is in `bcproxy/motionbox.py`. Checked on a recording that holds the same boxes twice: all 351 lists of the compressed form agree with the plain one. Drawn on the recording's own frames, the boxes sit on the vehicles.
+
+Places that do not have them: RTSP has only video and audio. Its `isapi.metadata` track (at `/ISAPI/Streaming/channels/101`) gives one sample per target, and an alert's `TargetRect` is also one sample. `httpPreview` answers 403.
+
+| Camera | Live target boxes |
+|---|---|
+| BackDoor (DS-2CD2087G2-L) | ✅ Seen, on the sub stream |
+| MountainView (DS-2CD2347G2-LU) | ✅ Seen. Its sub stream answers `deviceError`, so this reads the main stream |
+| CameraTest, MainDoor, Backyard (DS-2CD2347G1-L) | ✅ Seen on CameraTest while somebody walked through, and once on Backyard, in their own form of the list (main stream; the sub stream answers `deviceError`). Not drawn on frames for a check: no recordings on these |
+| Road (DS-2CD7526G0-IZHS) | ❌ None seen, 45 s |
+| Crossroad (DS-2CD4232FWD-IZH8) | ❌ No session token (HTTP 403) |
+| Dahua | ❌ Not looked at; off |
+
+- **Cost:** One more connection to the camera while somebody watches, and an NVR watches all day. No decoding: the proxy only reads packet headers and the target lists. Measured at about 330 kbps on BackDoor's sub stream; a camera falling back to its main stream sends that whole stream to the proxy. The CPU load on the Cloud Key is not measured.
+- **Requires:** The camera's WebSocket service on. Turn the feature off with `motion_boxes: false`.
+- **Delay:** Boxes and video come over separate connections, so they are not matched frame by frame.
+- **Not covered:** Playback has no boxes yet. `ISAPI/ContentMgmt/download` gives the same packets for a recording, which is where to start.
 
 ## Dahua cameras
 
@@ -99,19 +238,9 @@ Which of the two made the stream load on the NVR is not known: both were fixed t
 - `MoveStatus` of `getStatus` reports Idle too early when going to a preset. To tell whether it arrived, check that the position has stopped changing.
 - The camera's own return-home task (PtzAutoMovement) is outside the proxy's control and may turn the view back after an app operation.
 
-## Quick start
+## Development
 
-```bash
-pip install -r requirements.txt        # cryptography + PyYAML; ffmpeg/ffprobe are also required
-cp config.example.yaml config.yaml     # fill in Hikvision address/account/RTSP, the virtual camera's IP and password
-python -m bcproxy -c config.yaml -v
-```
-
-Then add the camera manually in the Reolink NVR: use the IP from `listen`, port 9000, and the `username` and `password` from the config.
-
-**One IP per Hikvision camera:** The NVR tells cameras apart by IP. On Linux, add alias IPs to the proxy host (`ip addr add 192.168.1.201/24 dev eth0`) or use Docker macvlan. For Windows, see below.
-
-## Local testing without an NVR
+### Local testing without an NVR
 
 ```bash
 # Terminal 1: fake Hikvision (Digest auth + alertStream + snapshot); type events: vmd human / line 1 vehicle / field 2 human
@@ -125,33 +254,51 @@ python tools/bc_client.py 127.0.0.1 -p change-me --preview subStream --out sub.h
 
 For Dahua, use `python tools/fake_dahua.py --port 8081` (account `admin` / `dahua12345`). It accepts `motion`, `human`, `human off`, `line 1 Human`, `region 2 Vehicle` and `blind`.
 
-## Compatibility status
+### Filling in missing messages from a real camera
 
-Tested on a real Reolink NVR and the Reolink mobile app (Hikvision 2688×1520 H.265 main stream + 640×360 sub stream):
+1. Export replies from a real Reolink camera:
+   `python tools/bc_client.py <camera IP> -p <password> --dump-templates captured/ --get 26 46 56 76 110 112 113 122 132 146 208`
+   Add `--nvr-magic` to imitate the NVR's header.
+2. Or capture between the NVR and a real camera, then decrypt:
+   `python tools/bc_dump.py nvr.pcap -p <camera password> --templates captured/`
+   When capturing from a mobile app is impractical, use the relay: `python tools/bc_relay.py <camera IP> --listen 0.0.0.0:9001 --out app.pcap`, add "this PC's IP:9001" by IP in the app, then decrypt `app.pcap` with bc_dump.py.
+3. `captured/<id>.xml` takes priority over the built-in templates. Fields such as model and UID can become placeholders like `${model}` and `${uid}`.
+4. With `trace: true`, `unhandled msg N` in the log marks messages that still lack a template. Each ID is warned about once per connection.
 
-| Feature | Status | Notes |
-|---|---|---|
-| Manual add / login | ✅ Verified | FULL_AES (0x12) encryption, echoes the NVR's header magic `0x0FEDCBA0` |
-| Live preview (main/sub) | ✅ Verified | Works on both NVR and app |
-| Renaming a camera | ✅ Verified | Saved to `state_dir` and synced to the Hikvision channel name (`hik.sync_name`) |
-| AI and smart detection events | 🟡 Code done | msg 31/33; recording triggers and icons still to be confirmed on the NVR |
-| Stream settings page (56 / 146) | 🟡 To verify | v7 added `videoEncType`; bitrate now reads Hikvision's actual config |
-| Bitrate / CPU usage | 🟡 To confirm on the NVR | 122 answers `<PerformanceInfo>` (`cpuUseRate`, `codeRate`, `netDataRate`); message id and fields come from Reolink Client's SDK; Dahua has no CPU value and shows 0 |
-| App settings pages | 🟡 To verify | 37 ports, 42 email, 46 motion detection, 52 privacy mask, 76 network, 112 streams, 120 online users, 132 image; formats follow real captures |
-| Stream resolution | 🟡 To verify in the app | 146 lists all main stream resolutions Hikvision offers (the sub stream is fixed, as on real cameras); writing 57 changes Hikvision's resolution, frame rate and bitrate and reconnects the video. The app's `videoEncType` and `encoderType` are unreliable and ignored |
-| Recording settings page | 🟡 To verify in the app | 81/82 ↔ Hikvision's recording schedule (Normal = CMR, other types = EDR), 54/55 ↔ overwrite, pre-record, post-record |
-| Advanced network settings page | 🟡 To verify in the app | 40/97/210/455, only stored in the proxy, Hikvision's network is not changed |
-| Tamper Alert | 🟡 To verify in the app | Bit 25 of `aitype` in 199 declares it, 763/764 read and write Hikvision's tamper detection switch; Hikvision's `shelteralarm` is reported as `tamper` |
-| Manual light | 🟡 To verify in the app | 288 → Hikvision supplementLight, back to the previous mode after `light_seconds` (default 30 s), 291 pushes the state |
-| Audio | 🟡 To verify in the app | Main stream audio is transcoded to 16 kHz AAC and sent with the preview (preview only; Hikvision has no speaker here, so no two-way audio) |
-| Motion Boxes | 🟡 To verify in the app | Live preview only, with the camera's own target boxes, on the cameras that send them. Checked end to end up to Reolink Client's own parser; drawing on screen and passing through the NVR are not yet seen. See below |
-| Playback | 🟡 To verify | Hikvision SD card: ISAPI recording search + RTSP playback (only the selected clip, stops at its end) → 102/142/14/15/16/381/382, seeking 383; off automatically when Hikvision has no storage. 298 timeline thumbnails are not implemented |
-| LAN discovery | 🟡 Code done | UDP 2000, reply format follows real captures; the NVR's search packets are confirmed received and answered, display in the NVR's "add camera" list still to be confirmed |
-| Other messages | ❌ Unknown | 110, 113, 122 etc. answer an empty 200; 257 answers 400, 789/818 answer 405 (same as a real camera) |
+### Project layout
 
-### Performance
+```
+bcproxy/
+  crypto.py     BCEncrypt XOR / AES-128-CFB, login hash and key derivation
+  bc.py         Baichuan frame codec (header, magic, extension XML, binary mode, FULL_AES)
+  bcmedia.py    BcMedia container (InfoV2 / I frame / P frame / AAC), Annex-B access unit splitting
+  hevcps.py     H.265 VPS/SPS rewrites for the NVR and for Reolink's mp4 writer
+  session.py    Server session: login negotiation, template replies, settings writes, alert subscription (31/33), preview (3/4), snapshot (109)
+  camera.py     Virtual camera: Hikvision events → state machine → push; capability bits, renaming, Hikvision status polling
+  discovery.py  LAN discovery replies (UDP 2000 → 3000)
+  hikcfg.py     Settings written to Hikvision: streams, recording schedule, light
+  dahua.py      Dahua: event stream, config tables, SD card recordings (same interface as hik/hikcfg/HikRecordings)
+  playback.py   Playback: recording search, event tags, replay stream
+  settings.py   Merging and persisting settings written by the NVR or app
+  events.py     Event state machine + <AlarmEventList> generation
+  hik.py        ISAPI: Digest auth, alertStream, multipart parsing, alert mapping, HTTP push receiver
+  media.py      ffprobe/ffmpeg pulling RTSP, one ffmpeg shared by all viewers, bitrate statistics, keyframe requests for short GOPs
+  logsetup.py   Console and rotating log files, passwords removed before writing
+  watchdog.py   systemd readiness notification and watchdog heartbeat, checks that background tasks are alive
+  netalias.py   Adds the cameras' listen IPs to the network interface and keeps them there
+  templates/    Built-in reply templates (can be overridden by templates_dir)
+deploy/         Cloud Key deployment: systemd service, install script for the device, push script for the PC
+tools/
+  bc_client.py  Baichuan client (tests the proxy / exports templates from a real camera / --raw saves frames)
+  bc_dump.py    pcap/pcapng decryption tool
+  bc_discover.py LAN search (lists real and virtual cameras)
+  bc_relay.py   Recording relay between app/NVR and a real camera (writes a pcap for bc_dump.py)
+  fake_hik.py   Fake Hikvision ISAPI service
+  fake_dahua.py Fake Dahua CGI service (with PTZ)
+tests/          Protocol tests (using real camera samples from neolink) + end-to-end tests: python -m pytest
+```
 
-Measured (2.0 Mbps main stream): parsing, packaging and encryption about 0.16% of one core, ffmpeg forwarding about 2%, audio transcoding about 1.6%. CPU is not the bottleneck. The wait for the first frame (1.3–2 s) is mostly RTSP and ffmpeg's analysis. `-fflags nobuffer` and a small `-probesize` give no picture on the main stream and in playback, so don't use them.
+## Technical notes
 
 ### ffmpeg hangs
 
@@ -161,30 +308,6 @@ Measured (2.0 Mbps main stream): parsing, packaging and encryption about 0.16% o
 ### TODO: seeking in playback
 
 Dragging the progress bar still has problems (the exact behavior in the app is yet to be written down). The reply format of 383 is inferred, with no sample from a real camera, and a capture of seeking on a real camera is still missing. To stay under the size limit of one message, the recording list merges segments, and seeking into a gap this creates lands on the next real recording.
-
-### Motion Boxes
-
-**Format:** The boxes travel in the extension area of each video frame, and the client draws them itself. The layout is in `bcproxy/motionbox.py`, from an NVR main stream capture and checked by calling the frame parser in Reolink Client's `libBCSDKWrapper` directly: for the same boxes, its result differs from a real frame's only in the score and class we choose, and a frame without boxes gives the same result as a real one.
-
-**The switch:** Reolink Client shows it once a frame carries this data (`hasAiData` sets `supportAiMark`). No capability bit in 199 is involved. So frames carry the extension only after the camera has sent its first target list, and a camera that sends none shows no option. The mobile app's check is not visible from here.
-
-**Where the boxes come from:** Only from the camera; nothing is computed on the proxy. What Hik-Connect draws comes with the stream of the web preview: a WebSocket on port 7681 (`/ISAPI/Security/token`, then `realplay`), RTP with private packets of payload type 112, the same ones stored in recordings. The packet layout is in `bcproxy/motionbox.py`. Checked on a recording that holds the same boxes twice: all 351 lists of the compressed form agree with the plain one. Drawn on the recording's own frames, the boxes sit on the vehicles.
-
-Places that do not have them: RTSP has only video and audio. Its `isapi.metadata` track (at `/ISAPI/Streaming/channels/101`) gives one sample per target, and an alert's `TargetRect` is also one sample. `httpPreview` answers 403.
-
-| Camera | Live target boxes |
-|---|---|
-| BackDoor (DS-2CD2087G2-L) | ✅ Seen, on the sub stream |
-| MountainView (DS-2CD2347G2-LU) | ✅ Seen. Its sub stream answers `deviceError`, so this reads the main stream |
-| CameraTest, MainDoor, Backyard (DS-2CD2347G1-L) | ✅ Seen on CameraTest while somebody walked through, and once on Backyard, in their own form of the list (main stream; the sub stream answers `deviceError`). Not drawn on frames for a check: no recordings on these |
-| Road (DS-2CD7526G0-IZHS) | ❌ None seen, 45 s |
-| Crossroad (DS-2CD4232FWD-IZH8) | ❌ No session token (HTTP 403) |
-| Dahua | ❌ Not looked at; off |
-
-- **Cost:** One more connection to the camera while somebody watches, and an NVR watches all day. No decoding: the proxy only reads packet headers and the target lists. Measured at about 330 kbps on BackDoor's sub stream; a camera falling back to its main stream sends that whole stream to the proxy. The CPU load on the Cloud Key is not measured.
-- **Requires:** The camera's WebSocket service on. Turn the feature off with `motion_boxes: false`.
-- **Delay:** Boxes and video come over separate connections, so they are not matched frame by frame.
-- **Not covered:** Playback has no boxes yet. `ISAPI/ContentMgmt/download` gives the same packets for a recording, which is where to start.
 
 ### Protocol pitfalls
 
@@ -204,104 +327,7 @@ Places that do not have them: RTSP has only video and audio. Its `isapi.metadata
 - **Encryption:** An NVR requests FULL_AES (`0xdc12`) and disconnects at once on a downgrade to AES (0x02). Binary payloads (video, JPEG) are encrypted whole, with `<encryptLen>` in the extension header. Real cameras also send `checkPos/checkValue` and encrypt only the first 1024 bytes. We don't, and the NVR and app decode fine.
 - **LAN discovery:** Every 2 seconds, an NVR broadcasts the 4 bytes `aa aa 00 00` from UDP 3000 to `255.255.255.255:2000`, and Reolink Client searches the same way. A device answers with a fixed 388-byte structure (IP, port, name, MAC, UID; for field offsets see `bcproxy/discovery.py`). The reply **always goes to the peer's UDP 3000**, whatever the source port of the request. The proxy listens on `0.0.0.0:2000` and answers each search with one packet per virtual camera. `tools/bc_discover.py` lists real and virtual cameras on the LAN.
 - **Settings messages:** Settings written by the NVR or app (25/45/57/105/209/297, and pairs of "read N, write N+1") are merged into the matching read replies and saved to `state_dir/<camera>/<id>.xml`. Delete the file to restore the default.
-
-## Running on Windows
-
-- The IP in `listen` must already exist on a local network adapter. To add an alias IP, first switch the adapter to a static IP, then run
-  `netsh interface ipv4 add address "Ethernet" 192.168.0.201 255.255.255.0`.
-- Port 9000 may be reserved by Hyper-V, WSL or Docker (binding fails with `could not bind`). Check with `netsh interface ipv4 show excludedportrange protocol=tcp`. If it is reserved, run `net stop winnat`, then `netsh int ipv4 add excludedportrange protocol=tcp startport=9000 numberofports=1`, and finally `net start winnat`.
-- Allow inbound TCP 9000 and UDP 2000 (LAN discovery) through the firewall:
-  `New-NetFirewallRule -DisplayName "bcproxy 9000" -Direction Inbound -Protocol TCP -LocalPort 9000 -Action Allow`
-  `New-NetFirewallRule -DisplayName "bcproxy search" -Direction Inbound -Protocol UDP -LocalPort 2000 -Action Allow`
-- While Reolink Client runs on the same machine, it holds UDP 3000, and `tools/bc_discover.py` cannot run (the proxy itself is not affected).
-- To save the full log: `python -m bcproxy -c config.yaml -v *> log.txt`
-
-## Deploying to a UniFi Cloud Key Gen2 Plus
-
-Verified on a UCK-G2-Plus (UniFi OS 6.0.11, Debian 13, aarch64). All files live in `/data/bcproxy`, and systemd starts the service at boot. First install (Git Bash, with `UCK-G2-Plus` set up in `~/.ssh/config`):
-
-```bash
-deploy/push.sh --with-config      # copies code, config.yaml and state/, downloads Python and ffmpeg, starts the service
-deploy/push.sh                    # later code updates: leaves the device's config and state/ alone
-```
-
-**One IP per camera:** An NVR does not accept different ports on one IP. Put `alias_interface: eth0` in `config.yaml` and give each camera `listen: 192.168.0.5x:9000`. The proxy adds these IPs to the interface at startup, checks them every 30 seconds while running, and adds back any that are lost, with a line in `errors.log`. `/etc/systemd/network/eth0.network` is not changed, because UniFi OS generates that file. Keep these IPs out of the router's DHCP pool. When adding a camera to the NVR, use its IP and port 9000.
-
-**Logs** (`/data/bcproxy/logs/`, rotated, at most 6 files of 5 MB each):
-
-| File | Content |
-|---|---|
-| `errors.log` | WARNING and up; look here first |
-| `bcproxy.log` | Everything, at the level set by `log_level` |
-| `crash.log` | Python stacks from a fatal signal, including where a process killed by the watchdog was stuck |
-| `restarts.log` | The reason for each exit: `result=watchdog`, `oom-kill`, `exit-code` and so on |
-
-Passwords in RTSP URLs and XML are replaced with `***` before writing.
-
-**Diagnostics upload:** UniFi OS uploads the reports in `/persistent/report/` to Ubiquiti every hour, and the report from any process crashing on the device includes the full `ps` output. So ffmpeg's RTSP URL (with its password) is not on the command line, but in an ffconcat file in a memfd. `LimitCORE=1` keeps the proxy's own crashes from creating reports (0 won't do: the kernel ignores 0 for a piped `core_pattern`).
-
-Useful commands:
-
-```bash
-systemctl status bcproxy
-tail -f /data/bcproxy/logs/errors.log
-journalctl -u bcproxy -b
-```
-
-**Watchdog:** `Type=notify` + `WatchdogSec=60`. The heartbeat is sent from the event loop, so the service restarts when the loop hangs for 60 seconds or when a camera's background task (such as its event stream) dies. Whatever the reason for an exit, the service restarts after 10 seconds, with no limit on restarts.
-
-**Firmware updates:** An update runs `overlay_cleanup` (`/usr/share/initramfs-tools/scripts/ubnt-init/apq8053/boot-emmc`), which removes `/usr`, `/lib`, `/var` (except `var/log`) and parts of `/etc`, and keeps `/data` and the service files in `/etc/systemd/system`. That is why this doesn't use apt or the firmware's Python. `ubnt-dpkg-restore` only restores packages on the official whitelist, so packaging this as a deb would not help.
-
-This list is part of the firmware's script and may change. After an update, check `systemctl is-enabled bcproxy`. If the service is gone, restore it with the following command, which needs no network:
-
-```bash
-sh /data/bcproxy/app/deploy/install.sh
-```
-
-**A factory reset wipes `/data`**, and then the only way back is to run `deploy/push.sh --with-config` again. Keep a copy of `config.yaml` on the PC, and back up the device's `state/` if you need it.
-
-## Filling in missing messages from a real camera
-
-1. Export replies from a real Reolink camera:
-   `python tools/bc_client.py <camera IP> -p <password> --dump-templates captured/ --get 26 46 56 76 110 112 113 122 132 146 208`
-   Add `--nvr-magic` to imitate the NVR's header.
-2. Or capture between the NVR and a real camera, then decrypt:
-   `python tools/bc_dump.py nvr.pcap -p <camera password> --templates captured/`
-   When capturing from a mobile app is impractical, use the relay: `python tools/bc_relay.py <camera IP> --listen 0.0.0.0:9001 --out app.pcap`, add "this PC's IP:9001" by IP in the app, then decrypt `app.pcap` with bc_dump.py.
-3. `captured/<id>.xml` takes priority over the built-in templates. Fields such as model and UID can become placeholders like `${model}` and `${uid}`.
-4. With `trace: true`, `unhandled msg N` in the log marks messages that still lack a template. Each ID is warned about once per connection.
-
-## Project layout
-
-```
-bcproxy/
-  crypto.py     BCEncrypt XOR / AES-128-CFB, login hash and key derivation
-  bc.py         Baichuan frame codec (header, magic, extension XML, binary mode, FULL_AES)
-  bcmedia.py    BcMedia container (InfoV2 / I frame / P frame / AAC), Annex-B access unit splitting
-  session.py    Server session: login negotiation, template replies, settings writes, alert subscription (31/33), preview (3/4), snapshot (109)
-  camera.py     Virtual camera: Hikvision events → state machine → push; capability bits, renaming, Hikvision status polling
-  discovery.py  LAN discovery replies (UDP 2000 → 3000)
-  hikcfg.py     Settings written to Hikvision: streams, recording schedule, light
-  dahua.py      Dahua: event stream, config tables, SD card recordings (same interface as hik/hikcfg/HikRecordings)
-  playback.py   Playback: recording search, event tags, replay stream
-  settings.py   Merging and persisting settings written by the NVR or app
-  events.py     Event state machine + <AlarmEventList> generation
-  hik.py        ISAPI: Digest auth, alertStream, multipart parsing, alert mapping, HTTP push receiver
-  media.py      ffprobe/ffmpeg pulling RTSP, one ffmpeg shared by all viewers, bitrate statistics
-  logsetup.py   Console and rotating log files, passwords removed before writing
-  watchdog.py   systemd readiness notification and watchdog heartbeat, checks that background tasks are alive
-  netalias.py   Adds the cameras' listen IPs to the network interface and keeps them there
-  templates/    Built-in reply templates (can be overridden by templates_dir)
-deploy/         Cloud Key deployment: systemd service, install script for the device, push script for the PC
-tools/
-  bc_client.py  Baichuan client (tests the proxy / exports templates from a real camera)
-  bc_dump.py    pcap/pcapng decryption tool
-  bc_discover.py LAN search (lists real and virtual cameras)
-  bc_relay.py   Recording relay between app/NVR and a real camera (writes a pcap for bc_dump.py)
-  fake_hik.py   Fake Hikvision ISAPI service
-  fake_dahua.py Fake Dahua CGI service (with PTZ)
-tests/          Protocol tests (using real camera samples from neolink) + end-to-end tests: python -m pytest
-```
+- **Live frame time:** The Reolink app's live view stops for good when the frame time goes back. The time is microseconds since the device started, like a real camera's: the low 32 bits in `micros`, the high half in the last header field (real cameras send 0x1 and 0x47 there). Before, the low half wrapped every 71.6 minutes and the view froze. For testing, `debug_wrap_in` (seconds) puts the next wrap that far ahead.
 
 ## Other limitations
 
