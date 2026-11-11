@@ -148,10 +148,13 @@ async def amain(a) -> None:
         reader = bcmedia.BcMediaReader()
         frames = {"I": 0, "P": 0, "audio": 0}
         out = open(a.out, "wb") if a.out else None
+        raw = open(a.raw, "wb") if a.raw else None
         end = time.monotonic() + a.seconds
         pending = [rep]
         while time.monotonic() < end:
             m = pending.pop() if pending else await asyncio.wait_for(q.get(), 10)
+            if raw:
+                raw.write(m.payload)
             for kind, meta, data in reader.feed(m.payload):
                 if kind == "info":
                     print("info", meta)
@@ -190,6 +193,7 @@ def main() -> None:
     ap.add_argument("--alarms", action="store_true", help="subscribe (msg 31) and print msg 33")
     ap.add_argument("--preview", choices=["mainStream", "subStream"])
     ap.add_argument("--out", help="write received Annex-B video here")
+    ap.add_argument("--raw", help="write the received BcMedia stream (frame headers, extra data) here")
     ap.add_argument("--snap", help="request a snapshot and save the JPEG here")
     ap.add_argument("--seconds", type=float, default=10)
     ap.add_argument("-v", "--verbose", action="store_true")
