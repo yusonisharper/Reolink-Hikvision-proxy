@@ -10,6 +10,7 @@ from string import Template
 from xml.sax.saxutils import escape as xml_escape
 
 from . import bc, bcmedia, motionbox
+from . import hiksmart as hs
 from . import playback as pb
 from . import settings as st
 from .bc import BcMsg, body_xml, ext_xml, xml_value
@@ -226,6 +227,9 @@ class BcSession:
         if self.cam.hikcfg and msg.msg_id in CONTROL_IDS - self.cam.hikcfg.unhandled_msgs:
             await self.on_control(msg)
             return
+        kind = hs.READ_IDS.get(msg.msg_id) or hs.WRITE_IDS.get(msg.msg_id)
+        if kind and self.cam.hikcfg and kind in self.cam.hikcfg.smart_caps and await self.on_smart_rule(msg, kind):
+            return
         if msg.msg_id in SMART_MSG and not self.cam.templates.has(msg.msg_id):
             stype = SMART_MSG[msg.msg_id]
             zones = self.cam.cfg.smart_zones.get(stype)
@@ -381,6 +385,53 @@ class BcSession:
         self._spawn(self.send(BcMsg(MSG_LIGHT_STATUS, response=200, payload=body_xml(
             '<FloodlightStatusList version="1.1">\n<FloodlightStatus>\n<channel>0</channel>\n'
             f"<status>{1 if on else 0}</status>\n</FloodlightStatus>\n</FloodlightStatusList>"))))
+
+    # ------------------------------------------------- crossline / intrusion rules
+    def _rule_defaults(self, kind: str, index: int) -> dict:
+        zone = next((z for i, z in enumerate(self.cam.cfg.smart_zones.get(kind) or [])
+                     if int(z.get("zone", i)) == index), {})
+        return {"name": zone.get("name") or f"{hs.DEFAULT_NAME[kind]} {index + 1}",
+                "targets": list(zone.get("targets") or self.cam.cfg.ai_types)}
+
+    async def on_smart_rule(self, msg: BcMsg, kind: str) -> bool:
+        """The camera's own rules. False: reading them failed, answer as before."""
+        cfg, key = self.cam.hikcfg, hs.META_KEYS[kind]
+        meta = hs.meta_from(self.cam.settings.get(key))
+        if msg.msg_id in hs.READ_IDS:
+            try:
+                rules = await cfg.smart_rules(kind)
+            except Exception as e:  # noqa: BLE001 - camera unreachable: the configured zones, as before
+                log.warning("%s: reading %s rules failed: %s", self.tag, kind, e)
+                return False
+            for r in rules:
+                m = meta.get(r.index) or self._rule_defaults(kind, r.index)
+                r.name = m["name"]
+                if r.targets is None:
+                    r.targets = m["targets"]
+            await self.send(msg.reply(200, payload=hs.rules_xml(kind, rules)))
+            return True
+        log.info("%s: %s rule written by the client:\n%s", self.tag, kind, msg.payload_text)
+        try:
+            op, rule = hs.parse_write(kind, msg.payload)
+            if op == "delete":
+                await cfg.set_smart_rule(kind, rule.index, None)
+                meta.pop(rule.index, None)
+            elif op in ("add", "modify"):
+                hs.check(kind, rule, cfg.smart_caps[kind])
+                await cfg.set_smart_rule(kind, rule.index, rule)
+                meta[rule.index] = {"name": rule.name or self._rule_defaults(kind, rule.index)["name"],
+                                    "targets": rule.targets or []}
+            else:
+                raise hs.RuleError(f"unknown op {op!r}")
+        except Exception as e:  # noqa: BLE001 - refused here or by the camera: the client shows a failure
+            log.warning("%s: %s rule not written: %s", self.tag, kind, e)
+            await self.send(msg.reply(400))
+            return True
+        self.cam.settings.put(key, hs.meta_doc(meta))
+        log.info("%s: %s rule %d %s on the camera", self.tag, kind, rule.index + 1,
+                 "removed" if op == "delete" else "written")
+        await self.send(msg.reply(200))
+        return True
 
     # ------------------------------------------------- settings that reach the source camera
     async def on_control(self, msg: BcMsg) -> None:

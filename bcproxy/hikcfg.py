@@ -4,6 +4,8 @@ Streams    57 Compression       <-> /ISAPI/Streaming/channels/<ch>0<1|2>
 Recording  81/82 Record         <-> /ISAPI/ContentMgmt/record/tracks/<ch>01 (schedule)
            54/55 RecordCfg      <-> same track (overwrite, pre/post record time)
 Light      288 FloodlightManual  -> /ISAPI/Image/channels/<ch>/supplementLight
+Rules      527/528 Crossline    <-> /ISAPI/Smart/LineDetection/<ch>   (see hiksmart.py)
+           529/530 Intrusion    <-> /ISAPI/Smart/FieldDetection/<ch>
 
 Hikvision wants whole documents back on PUT, so the current document is read
 and only the affected elements are replaced.
@@ -16,6 +18,7 @@ import xml.etree.ElementTree as ET
 from dataclasses import dataclass, field
 from xml.sax.saxutils import escape as xml_escape
 
+from . import hiksmart as hs
 from .bc import XML_DECL
 from .hik import HikHttp, _strip_ns
 from .settings import _body
@@ -196,6 +199,7 @@ class HikConfig:
         self.scene_is_tamper = False              # scene change is reported as tamper: one switch for both
         self._external_light = False              # the light is SupplementLight in externalDevice (DS-2CD2347G1-L)
         self._external_saved: str | None = None   # that document as it was before the light was switched on
+        self.smart_caps: dict[str, hs.Caps] = {}  # crossline / intrusion rules the camera has
 
     # ----------------------------------------------------------------- status
     async def cpu_usage(self) -> int | None:
@@ -250,11 +254,31 @@ class HikConfig:
                     self._external_light, self.light_on_mode = True, EXTERNAL_LIGHT_ON
             except Exception as e:  # noqa: BLE001 - no external device on this model
                 log.debug("no external light: %s", e)
+        for kind, k in hs.KINDS.items():
+            try:
+                self.smart_caps[kind] = hs.parse_caps(
+                    kind, await self.http.get_bytes(self._smart_path(kind) + "/capabilities"))
+            except (ConnectionError, ValueError, ET.ParseError) as e:  # model without this detection
+                log.debug("no %s rules: %s", kind, e)
         try:
             await self.tamper_enabled()
             self.has_tamper = True
         except ConnectionError as e:  # model without tamper detection
             log.debug("no tamper detection: %s", e)
+
+    # ------------------------------------------------------- crossline / intrusion rules
+    def _smart_path(self, kind: str) -> str:
+        return hs.KINDS[kind].path.format(ch=self.channel)
+
+    async def smart_rules(self, kind: str) -> list[hs.Rule]:
+        return hs.rules_from_hik(kind, await self.http.get_bytes(self._smart_path(kind)), self.smart_caps[kind])
+
+    async def set_smart_rule(self, kind: str, index: int, rule: hs.Rule | None) -> None:
+        """Rule `index` set to `rule`, or switched off for None."""
+        path = self._smart_path(kind)
+        doc = hs.apply(kind, await self.http.get_bytes(path), rule, index, self.smart_caps[kind])
+        status, body = await self.http.put_bytes(path, doc)
+        _check(status, body, f"PUT {path}")
 
     @property
     def _tamper_path(self) -> str:

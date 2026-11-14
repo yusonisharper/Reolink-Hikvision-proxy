@@ -319,6 +319,7 @@ class DahuaConfig:
     when the camera has listed them. Recording settings and server ports are not connected."""
     unhandled_msgs = frozenset({37, 38, 54, 55, 81, 82})
     can_request_keyframe = False
+    smart_caps: dict = {}           # crossline / intrusion rules are not connected
 
     def __init__(self, http: DahuaHttp, channel: int | None = 1) -> None:
         self.http = http
