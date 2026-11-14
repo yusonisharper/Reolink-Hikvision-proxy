@@ -181,7 +181,44 @@ def test_line_written_read_back_and_removed():
     assert b"<x>0.200</x>\n<y>0.800</y>" in read and b"<x>0.800</x>\n<y>0.200</y>" in read
     assert out["delete"] == 200
     assert b"<crosslineDetectItem>" not in out["after"]
-    assert "<LineItem>\n<id>1</id>\n<enabled>false</enabled>" in fake.docs[LINE].decode()
+    doc = fake.docs[LINE].decode()
+    assert "<LineItem>\n<id>1</id>\n<enabled>false</enabled>" in doc
+    assert doc.count("<positionX>0</positionX><positionY>0</positionY>") == 2
+    assert "<LineDetection>\n<id>1</id>\n<enabled>false</enabled>" in doc     # no rule left: detection off
+
+
+def test_rule_shows_although_the_camera_keeps_its_own_enabled_false():
+    """A G1 answers OK to <enabled>true</enabled> in a LineItem and still reads false."""
+    cam, fake = _g1_cam()
+    put = fake.put_bytes
+
+    async def g1_put(path, body, method="PUT"):
+        return await put(path, body.replace(b"<LineItem>\n<id>1</id>\n<enabled>true",
+                                            b"<LineItem>\n<id>1</id>\n<enabled>false"))
+    fake.put_bytes = g1_put
+
+    async def script(c):
+        await c.request(528, payload=_crossline("add", [(0.2, 0.1), (0.2, 0.9)]))
+        return (await c.request(527)).payload
+
+    read = _session(cam, script)
+    assert b"<LineItem>\n<id>1</id>\n<enabled>false" in fake.docs[LINE]
+    assert b"<enable>1</enable>" in read and xml_value(read, "direction") == "antiClockwise"
+
+
+def test_one_of_several_rules_removed_leaves_the_detection_on():
+    cam, fake = _cam()
+    fake.docs.update({FIELD: _g2_field(), FIELD + "/capabilities": _g2_field_caps()})
+
+    async def script(c):
+        await c.request(530, payload=_intrusion("add", AREA, index=1))
+        await c.request(530, payload=_intrusion("add", AREA, index=2))
+        await c.request(530, payload=_intrusion("delete", [], index=1))
+        return (await c.request(529)).payload
+
+    read = _session(cam, script)
+    assert [i for i in range(4) if f"<index>{i}</index>".encode() in read] == [2]
+    assert f'<FieldDetection version="2.0" {NS}><id>1</id><enabled>true</enabled>' in fake.docs[FIELD].decode()
 
 
 @pytest.mark.parametrize("payload", [
@@ -200,9 +237,11 @@ def test_line_the_camera_cannot_take_is_refused(payload):
 
 
 def test_existing_camera_line_gets_the_configured_name():
+    """MainDoor as read on 2026-11-14: a line drawn in the web page, its own <enabled> false."""
     cam, fake = _g1_cam()
-    fake.docs[LINE] = G1_LINE.replace(b"<enabled>false</enabled>", b"<enabled>true</enabled>").replace(
-        b"<positionX>0</positionX>\n<positionY>0</positionY>", b"<positionX>907</positionX>\n<positionY>512</positionY>", 1)
+    zero = b"<positionX>0</positionX>\n<positionY>0</positionY>"
+    fake.docs[LINE] = G1_LINE.replace(zero, b"<positionX>907</positionX>\n<positionY>512</positionY>", 1).replace(
+        zero, b"<positionX>28</positionX>\n<positionY>406</positionY>", 1)
 
     async def script(c):
         return (await c.request(527)).payload

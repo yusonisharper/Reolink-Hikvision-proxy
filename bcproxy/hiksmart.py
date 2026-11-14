@@ -10,6 +10,9 @@ Reolink, from NVR captures (2026-11-14):
 
 Hikvision: points 0..1000, origin bottom left; a fixed number of rule slots (1 on G1, 4 on G2); a region
 needs between min/maxRegionCoordinatesNum points; detectionTarget exists on AcuSense models only.
+A rule's own <enabled> is not kept (a G1 answers OK to true and still reads false; lines drawn in its web
+page read false too): a slot is a rule when the detection is on and the slot has a shape. Removing a rule
+clears its points, and switches the detection off when no rule is left.
 Names, and the targets of models without detectionTarget, are kept by the proxy.
 """
 from __future__ import annotations
@@ -127,14 +130,13 @@ def targets_to_hik(targets: list[str], caps: Caps) -> str:
 
 
 def rules_from_hik(kind: str, doc: bytes, caps: Caps) -> list[Rule]:
-    """The enabled rules with a usable shape."""
-    k, out = KINDS[kind], []
-    for item in _root(doc).findall(f".//{k.item}"):
-        if (item.findtext("enabled") or "").strip() != "true":
-            continue
-        pts = [(int(c.findtext("positionX") or 0), int(c.findtext("positionY") or 0))
-               for c in item.findall(f"{k.coords}/{k.coord}")]
-        if len(pts) < (2 if kind == CROSSLINE else 3) or not any(x or y for x, y in pts):
+    """The slots with a shape, while the detection is on."""
+    k, out, root = KINDS[kind], [], _root(doc)
+    if (root.findtext("enabled") or "").strip() != "true":
+        return out
+    for item in root.findall(f".//{k.item}"):
+        pts = _points(item, k)
+        if not _has_shape(kind, pts):
             continue
         target = item.findtext("detectionTarget")
         out.append(Rule(
@@ -145,6 +147,15 @@ def rules_from_hik(kind: str, doc: bytes, caps: Caps) -> list[Rule]:
             stay=int(item.findtext("timeThreshold") or 0),
             targets=targets_from_hik(target, caps) if target is not None and caps.targets else None))
     return out
+
+
+def _points(item: ET.Element, k: Kind) -> list[tuple[int, int]]:
+    return [(int(c.findtext("positionX") or 0), int(c.findtext("positionY") or 0))
+            for c in item.findall(f"{k.coords}/{k.coord}")]
+
+
+def _has_shape(kind: str, pts: list[tuple[int, int]]) -> bool:
+    return sum(1 for x, y in pts if x or y) >= (2 if kind == CROSSLINE else 3)
 
 
 def rules_xml(kind: str, rules: list[Rule], channel: int = 0) -> bytes:
@@ -205,7 +216,7 @@ def _set_in(text: str, tag: str, value) -> str:
 
 
 def apply(kind: str, doc: bytes, rule: Rule | None, index: int, caps: Caps) -> bytes:
-    """The Hikvision document with slot `index` set to `rule`, or switched off for None."""
+    """The Hikvision document with slot `index` set to `rule`, or cleared for None."""
     k, text = KINDS[kind], doc.decode("utf-8")
     pattern = re.compile(rf"<{k.item}(?=[\s>]).*?</{k.item}>", re.S)
     for m in pattern.finditer(text):
@@ -214,7 +225,13 @@ def apply(kind: str, doc: bytes, rule: Rule | None, index: int, caps: Caps) -> b
         if not idm or int(idm.group(1)) != index + 1:
             continue
         block = _set_in(block, "enabled", "false" if rule is None else "true")
-        if rule is not None:
+        if rule is None:
+            # a line keeps its two points, as an unused G1 slot has them; a region is left empty
+            zero = f"<{k.coord}><positionX>0</positionX><positionY>0</positionY></{k.coord}>" * 2
+            block = re.sub(rf"<{k.coords}(?:\s[^>]*)?>.*?</{k.coords}>",
+                           lambda _: f"<{k.coords}>{zero if kind == CROSSLINE else ''}</{k.coords}>",
+                           block, count=1, flags=re.S)
+        else:
             block = _set_in(block, "sensitivityLevel", max(1, min(100, rule.sensitivity)))
             if kind == CROSSLINE:
                 block = _set_in(block, "directionSensitivity", DIRECTION_TO_HIK[rule.direction])
@@ -232,8 +249,11 @@ def apply(kind: str, doc: bytes, rule: Rule | None, index: int, caps: Caps) -> b
             if caps.targets and rule.targets is not None and "<detectionTarget" in block:
                 block = _set_in(block, "detectionTarget", targets_to_hik(rule.targets, caps))
         text = text[:m.start()] + block + text[m.end():]
-        if rule is not None:     # the detection as a whole must be on too: the first <enabled> is its switch
+        # the first <enabled> switches the detection as a whole: on with a rule, off when none is left
+        if rule is not None:
             text = _set_in(text, "enabled", "true")
+        elif not any(_has_shape(kind, _points(item, k)) for item in _root(text).findall(f".//{k.item}")):
+            text = _set_in(text, "enabled", "false")
         return text.encode("utf-8")
     raise RuleError(f"no {k.item} {index + 1} in the camera's document")
 
