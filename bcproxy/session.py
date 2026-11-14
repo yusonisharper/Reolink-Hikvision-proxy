@@ -33,6 +33,9 @@ WRAP = 1 << 32
 QUIET_OK = {192, 287}
 # What a real camera (dual-lens RLC, app capture) answers for features it lacks.
 ERROR_REPLY = {257: 400, 789: 405, 818: 405}
+# Recording settings of a camera whose recording is not connected (Dahua): the NVR reads 54/81 on every
+# connect and gets the fixed templates; a write is acknowledged but not kept, as the camera is unchanged.
+UNSAVED_WRITES = {55, 82}
 # Read-only views of a setting that is written through another id: answer
 # with the template, overlaid with what the client stored (132 = 26 + ranges).
 READ_OVERLAY = {132: 26, 110: 44}
@@ -235,6 +238,11 @@ class BcSession:
             await self.send(msg.reply(200, payload=self.cam.performance_xml()))
             return
         is_write = bool(msg.payload) and not msg.binary
+        if msg.msg_id in UNSAVED_WRITES:
+            log.info("%s: msg %d not written: this camera's recording settings are not connected",
+                     self.tag, msg.msg_id)
+            await self.send(msg.reply(200))
+            return
         if is_write:
             get_id = st.get_for_set(msg.msg_id, msg.payload, self._get_reply)
             if get_id is not None:

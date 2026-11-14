@@ -382,9 +382,14 @@ def test_app_messages_end_to_end(monkeypatch):
             await asyncio.sleep(0.01)
         await c.request(382)
         # record settings are not connected: the app gets an answer, the camera no write
-        out["record"] = (await c.request(81)).response
+        out["record"] = (await c.request(81)).payload
         out["record_set"] = (await c.request(82, payload=bc.body_xml(
             '<Record version="1.1">\n<channelId>0</channelId>\n<enable>0</enable>\n</Record>'))).response
+        out["record_after"] = (await c.request(81)).payload
+        out["record_cfg"] = (await c.request(54)).payload
+        out["record_cfg_set"] = (await c.request(55, payload=bc.body_xml(
+            '<RecordCfg version="1.1">\n<channelId>0</channelId>\n<cycle>0</cycle>\n</RecordCfg>'))).response
+        out["record_cfg_after"] = (await c.request(54)).payload
         out["image"] = (await c.request(132)).payload
         out["image_set"] = (await c.request(25, payload=bc.body_xml(
             '<VideoInput version="1.1">\n<bright>255</bright>\n</VideoInput>'))).response
@@ -399,7 +404,11 @@ def test_app_messages_end_to_end(monkeypatch):
     assert out["replay"] == 200
     assert urls[0] == ("rtsp://u:p@h:554/cam/playback?channel=1"
                        "&starttime=2026_11_03_08_01_00&endtime=2026_11_03_08_10_00")
-    assert out["record"] == 200 and out["record_set"] == 200
+    # the fixed templates answer, and a write leaves them as they were
+    assert b"<enable>1</enable>" in out["record"] and b"<type>Normal</type>" in out["record"]
+    assert out["record_set"] == 200 and out["record_after"] == out["record"]
+    assert b"<cycle>1</cycle>" in out["record_cfg"] and b"<preRecordTime>" in out["record_cfg"]
+    assert out["record_cfg_set"] == 200 and out["record_cfg_after"] == out["record_cfg"]
     assert b"<bright>128</bright>" in out["image"]
     assert out["image_set"] == 200
     assert fake.sets == [{f"VideoColor[0][{p}].Brightness": "100" for p in range(3)}]

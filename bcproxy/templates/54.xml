@@ -1,0 +1,11 @@
+<RecordCfg version="1.1">
+<channelId>0</channelId>
+<cycle>1</cycle>
+<recordDelayTime>5</recordDelayTime>
+<preRecordTime>5</preRecordTime>
+<packageTime>5</packageTime>
+<cyclelist>
+<item>0</item>
+<item>1</item>
+</cyclelist>
+</RecordCfg>
