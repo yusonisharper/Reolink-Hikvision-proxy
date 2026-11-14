@@ -434,6 +434,30 @@ def run_ptz(fake, script, **kw):
     return run(fake, go)
 
 
+def test_snapshot_data_comes_before_an_empty_201():
+    """The NVR writes only the 200 data messages and drops the picture unless they add up to
+    pictureSize, so the 201 end marker must carry nothing."""
+    fake = FakeDahua("admin", "pw", jpeg=b"\xff\xd8" + bytes(range(256)) * 300 + b"\xff\xd9")
+
+    async def script(c, cam):
+        rep = await c.request(109, payload=bc.body_xml(
+            '<Snap version="1.1">\n<channelId>0</channelId>\n<snapByAlarm>1</snapByAlarm>\n</Snap>'))
+        q = c.subs[(109, rep.msg_num)]
+        parts = []
+        while True:
+            m = await asyncio.wait_for(q.get(), 5)
+            parts.append(m)
+            if m.response == 201:
+                break
+        return int(xml_value(rep.payload, "pictureSize")), int(xml_value(rep.payload, "time")), parts
+
+    size, t, parts = run_ptz(fake, script)
+    data = b"".join(m.payload for m in parts if m.response == 200)
+    assert data == fake.jpeg and size == len(fake.jpeg) and len(parts) > 2
+    assert parts[-1].response == 201 and parts[-1].payload == b""
+    assert t > 1_700_000_000
+
+
 def test_ptz_moves_and_speed():
     fake = FakeDahua("admin", "pw")
 

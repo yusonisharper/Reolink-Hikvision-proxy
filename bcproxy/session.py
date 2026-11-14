@@ -762,16 +762,20 @@ class BcSession:
 
     # ------------------------------------------------------------- snapshot
     async def on_snap(self, msg: BcMsg) -> None:
+        t0 = time.monotonic()
         jpeg = await self.cam.snapshot_jpeg()
+        log.debug("%s: snap request -> %s in %.1fs\n%s", self.tag, f"{len(jpeg)} bytes" if jpeg else "failed",
+                  time.monotonic() - t0, msg.payload_text)
         if not jpeg:
             await self.send(msg.reply(400))
             return
         fname = time.strftime("01_%Y%m%d%H%M%S.jpg")
         await self.send(msg.reply(200, payload=body_xml(
             f'<Snap version="1.1">\n<channelId>0</channelId>\n<fileName>{fname}</fileName>\n'
-            f"<time>0</time>\n<pictureSize>{len(jpeg)}</pictureSize>\n</Snap>")))
-        chunks = [jpeg[i:i + SNAP_CHUNK] for i in range(0, len(jpeg), SNAP_CHUNK)]
-        for i, c in enumerate(chunks):
-            last = i == len(chunks) - 1
-            await self.send(msg.reply(201 if last else 200, ext=ext_xml(binaryData=1),
-                                      payload=c, binary=True))
+            f"<time>{int(time.time())}</time>\n<pictureSize>{len(jpeg)}</pictureSize>\n</Snap>")))
+        for i in range(0, len(jpeg), SNAP_CHUNK):
+            await self.send(msg.reply(200, ext=ext_xml(binaryData=1), payload=jpeg[i:i + SNAP_CHUNK],
+                                      binary=True))
+        # The end marker carries no data: the NVR closes the file on 201 without writing its payload,
+        # then drops the picture unless the bytes written equal pictureSize (FTP alarm pictures)
+        await self.send(msg.reply(201))
