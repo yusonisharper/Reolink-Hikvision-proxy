@@ -29,7 +29,7 @@ def test_msg_122_answers_performance_info(tmp_path):
 
     rep = asyncio.run(run())
     assert rep.response == 200 and b"<PerformanceInfo" in rep.payload
-    assert xml_value(rep.payload, "cpuUseRate") == "23" and xml_value(rep.payload, "codeRate") == "4096"
+    assert xml_value(rep.payload, "cpuUseRate") == "23" and xml_value(rep.payload, "codeRate") == "512000"
     assert int(xml_value(rep.payload, "netDataRate")) >= 0
 
 
@@ -38,7 +38,7 @@ def test_rate_meter():
     assert m.kbps() is None
     for _ in range(10):
         m.add(50_000)                       # 500 KB within <1 s, span clamped to 1 s
-    assert m.kbps() == 4000
+    assert m.kbps() == 4000 and m.bytes_per_s() == 500_000
 
 
 def test_real_values_from_stream_and_hik(tmp_path):
@@ -70,8 +70,8 @@ def test_real_values_from_stream_and_hik(tmp_path):
         return idle, live
 
     idle, live = asyncio.run(run())
-    assert xml_value(idle, "cpuUseRate") == "23" and xml_value(idle, "codeRate") == "4096"
-    assert xml_value(live, "codeRate") == "4000"
+    assert xml_value(idle, "cpuUseRate") == "23" and xml_value(idle, "codeRate") == "512000"
+    assert xml_value(live, "codeRate") == "500000"     # bytes/s: the NVR shows it as 4000 kbps
 
 
 def test_encoder_templates_use_codec_and_hik_bitrate():

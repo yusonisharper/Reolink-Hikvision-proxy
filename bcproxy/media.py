@@ -217,7 +217,7 @@ async def read_access_units(url: str, codec: str, ffmpeg: str = "ffmpeg", first_
 
 
 class RateMeter:
-    """Bytes/s over a sliding window -> kbit/s."""
+    """Bytes over a sliding window -> bytes/s or kbit/s."""
 
     def __init__(self, window: float = 5.0) -> None:
         self.window = window
@@ -229,14 +229,18 @@ class RateMeter:
         while self.samples and now - self.samples[0][0] > self.window:
             self.samples.popleft()
 
-    def kbps(self) -> int | None:
+    def bytes_per_s(self) -> int | None:
         now = time.monotonic()
         while self.samples and now - self.samples[0][0] > self.window:
             self.samples.popleft()
         if not self.samples:
             return None
         span = max(now - self.samples[0][0], 1.0)
-        return int(sum(n for _, n in self.samples) * 8 / 1000 / span)
+        return int(sum(n for _, n in self.samples) / span)
+
+    def kbps(self) -> int | None:
+        rate = self.bytes_per_s()
+        return None if rate is None else rate * 8 // 1000
 
 
 def split_adts(buf: bytearray) -> list[bytes]:

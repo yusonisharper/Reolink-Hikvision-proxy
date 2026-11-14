@@ -113,7 +113,7 @@ Tested on a real Reolink NVR and the Reolink mobile app (Hikvision 2688×1520 H.
 | Renaming a camera | ✅ Verified | Saved to `state_dir` and synced to the Hikvision channel name (`hik.sync_name`) |
 | AI and smart detection events | 🟡 Code done | msg 31/33; recording triggers and icons still to be confirmed on the NVR |
 | Stream settings page (56 / 146) | 🟡 To verify | v7 added `videoEncType`; bitrate now reads Hikvision's actual config |
-| Bitrate / CPU usage | 🟡 To confirm on the NVR | 122 answers `<PerformanceInfo>` (`cpuUseRate`, `codeRate`, `netDataRate`); message id and fields come from Reolink Client's SDK; Dahua has no CPU value and shows 0 |
+| Bitrate / CPU usage | 🟡 To confirm on the NVR | 122 answers `<PerformanceInfo>` (`cpuUseRate`, `codeRate`, `netDataRate`); message id and fields come from Reolink Client's SDK; rates are in bytes/s (Reolink camera firmware), the NVR shows them ×8/1000 as kbps; Dahua has no CPU value and shows 0 |
 | App settings pages | 🟡 To verify | 37 ports, 42 email, 46 motion detection, 52 privacy mask, 76 network, 112 streams, 120 online users, 132 image; formats follow real captures |
 | Stream resolution | 🟡 To verify in the app | 146 lists all main stream resolutions Hikvision offers (the sub stream is fixed, as on real cameras); writing 57 changes Hikvision's resolution, frame rate and bitrate and reconnects the video. The app's `videoEncType` and `encoderType` are unreliable and ignored |
 | Recording settings page | 🟡 To verify in the app | 81/82 ↔ Hikvision's recording schedule (Normal = CMR, other types = EDR), 54/55 ↔ overwrite, pre-record, post-record |

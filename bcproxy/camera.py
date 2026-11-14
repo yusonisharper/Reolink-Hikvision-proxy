@@ -515,12 +515,14 @@ class VirtualCamera:
 
     def performance_xml(self) -> bytes:
         """122 reply; names from libBCSDKWrapper's PerformanceInfo parser. Bitrate as measured while somebody
-        watches, otherwise as configured on the camera."""
-        main = self.main.rate.kbps() if self.main else None
-        rate = main if main is not None else (self.hik_bitrate or 0)
+        watches, otherwise as configured on the camera. Rates are in bytes/s: a Reolink camera's device
+        process sums frame bytes per second for MSG_ENC_BITRATE_GET (B800 firmware), and the NVR shows
+        codeRate * 8 / 1000 as kbps (kbit/s here showed 3.4 Mbps as 27 kbps)."""
+        main = self.main.rate.bytes_per_s() if self.main else None
+        rate = main if main is not None else (self.hik_bitrate or 0) * 1000 // 8
         cpu = self.hik_cpu if self.hik_cpu is not None else 0
         return body_xml(f'<PerformanceInfo version="1.1">\n<cpuUseRate>{cpu}</cpuUseRate>\n'
-                        f"<codeRate>{rate}</codeRate>\n<netDataRate>{self.tx.kbps() or 0}</netDataRate>\n"
+                        f"<codeRate>{rate}</codeRate>\n<netDataRate>{self.tx.bytes_per_s() or 0}</netDataRate>\n"
                         "</PerformanceInfo>")
 
     async def _ticker(self) -> None:
