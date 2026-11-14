@@ -408,6 +408,8 @@ class BcSession:
                 r.name = m["name"]
                 if r.targets is None:
                     r.targets = m["targets"]
+            log.info("%s: %s rules read by the client: %s\n%s%s", self.tag, kind,
+                     [r.index for r in rules], msg.ext_text, msg.payload_text)
             await self.send(msg.reply(200, payload=hs.rules_xml(kind, rules)))
             return True
         log.info("%s: %s rule written by the client:\n%s", self.tag, kind, msg.payload_text)
