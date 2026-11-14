@@ -30,8 +30,10 @@ WRITE_IDS = {528: CROSSLINE, 530: INTRUSION}
 META_KEYS = {CROSSLINE: 100527, INTRUSION: 100529}    # settings store slots for names and targets
 DEFAULT_NAME = {CROSSLINE: "Fence", INTRUSION: "Area"}
 
-# Reolink direction -> Hikvision directionSensitivity
-DIRECTION_TO_HIK = {"both": "any", "clockwise": "right-left", "antiClockwise": "left-right"}
+# Reolink direction -> Hikvision directionSensitivity. Checked on a G1 (2026-11-14): a line drawn top to
+# bottom with the NVR's arrow to the right (antiClockwise) shows its arrow to the right in the Hikvision web
+# page with right-left.
+DIRECTION_TO_HIK = {"both": "any", "clockwise": "left-right", "antiClockwise": "right-left"}
 DIRECTION_FROM_HIK = {v: k for k, v in DIRECTION_TO_HIK.items()}
 TARGET_TO_HIK = {"people": "human", "vehicle": "vehicle", "dog_cat": "others"}
 TARGET_FROM_HIK = {v: k for k, v in TARGET_TO_HIK.items()}
