@@ -99,7 +99,7 @@ sh /data/bcproxy/app/deploy/install.sh
 
 - 海康 `regionID`（从 1 开始）映射为 Reolink 区域编号 `zone`（从 0 开始）。
 - 越界这类单次脉冲告警会保持 `hold.smart` 秒，让 NVR 有时间触发录像；VMD 收到 `inactive` 时立即清除。
-- NVR 是否认为摄像头支持这些功能，取决于 msg 199 `<Support>` 中的 `<aitype>`（bit1=人, bit2=车, bit4=猫狗）和 `<smartAI>`（bit1=越界, bit2=入侵, bit3=徘徊）。这两个值根据配置里的 `ai_types` 和 `smart` 自动生成；msg 527/529/531 的区域列表也由配置生成。
+- NVR 是否认为摄像头支持这些功能，取决于 msg 199 `<Support>` 中的 `<aitype>`（bit1=人, bit2=车, bit4=猫狗）和 `<smartAI>`（bit1=越界, bit2=入侵, bit3=徘徊）。这两个值根据配置里的 `ai_types` 和 `smart` 自动生成。msg 527/529 的规则列表在海康有越界/区域入侵侦测时读自相机，否则和 531 的徘徊列表一样由 `smart` 生成。
 
 ## 兼容性状态
 
@@ -117,6 +117,7 @@ sh /data/bcproxy/app/deploy/install.sh
 | App 设置页 | 🟡 待验证 | 37 端口、42 邮件、46 移动侦测、52 隐私遮挡、76 网络、112 码流、120 在线用户、132 图像，格式按真机抓包 |
 | 码流分辨率 | 🟡 待 App 验证 | 146 列出海康提供的全部主码流分辨率（子码流和真机一样不可选）；57 写入后改海康的分辨率、帧率、码率并重连视频。App 发的 `videoEncType`、`encoderType` 不可信，不处理 |
 | 录像设置页 | 🟡 待 App 验证 | 81/82 ↔ 海康录像计划（Normal=CMR，其余类型=EDR），54/55 ↔ 覆盖、预录、延录 |
+| 越界 / 区域入侵规则 | ✅ 已在 G1（DS-2CD2347G1-L）上验证 | 527/528 ↔ `/ISAPI/Smart/LineDetection`，529/530 ↔ `FieldDetection`：NVR 显示相机上实际的线和区域，新增、修改、删除都写到相机（坐标、箭头方向、灵敏度、停留时间；AcuSense 机型还有目标类型）。折线和相机不支持的区域点数会被拒绝。NVR 只在连接时读取规则，修改后要等它重连才显示新的形状。见 [`bcproxy/hiksmart.py`](bcproxy/hiksmart.py) |
 | 高级网络设置页 | 🟡 待 App 验证 | 40/97/210/455，只保存在代理，不改海康网络 |
 | Tamper Alert | 🟡 待 App 验证 | 199 `aitype` 第 25 位声明能力，763/764 读写海康遮挡侦测开关；海康 `shelteralarm` 上报为 `tamper` |
 | 手动灯 | 🟡 待 App 验证 | 288 → 海康 supplementLight，`light_seconds`（默认 30 秒）后恢复原模式，291 推送状态 |

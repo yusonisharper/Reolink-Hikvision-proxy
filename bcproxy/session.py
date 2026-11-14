@@ -393,27 +393,24 @@ class BcSession:
         return {"name": zone.get("name") or f"{hs.DEFAULT_NAME[kind]} {index + 1}",
                 "targets": list(zone.get("targets") or self.cam.cfg.ai_types)}
 
-    async def _camera_rules(self, kind: str, meta: dict[int, dict]) -> list[hs.Rule]:
-        rules = await self.cam.hikcfg.smart_rules(kind)
-        for r in rules:
-            m = meta.get(r.index) or self._rule_defaults(kind, r.index)
-            r.name = m["name"]
-            if r.targets is None:
-                r.targets = m["targets"]
-        return rules
-
     async def on_smart_rule(self, msg: BcMsg, kind: str) -> bool:
-        """The camera's own rules. False: reading them failed, answer as before."""
+        """The camera's own rules. False: reading them failed, answer as before.
+        The NVR reads them only when it logs in; after its own write it keeps showing what it read then,
+        even with the new list in the 200 (tried 2026-11-14). The camera has the change all the same."""
         cfg, key = self.cam.hikcfg, hs.META_KEYS[kind]
         meta = hs.meta_from(self.cam.settings.get(key))
         if msg.msg_id in hs.READ_IDS:
             try:
-                rules = await self._camera_rules(kind, meta)
+                rules = await cfg.smart_rules(kind)
             except Exception as e:  # noqa: BLE001 - camera unreachable: the configured zones, as before
                 log.warning("%s: reading %s rules failed: %s", self.tag, kind, e)
                 return False
-            log.info("%s: %s rules read by the client: %s\n%s%s", self.tag, kind,
-                     [r.index for r in rules], msg.ext_text, msg.payload_text)
+            for r in rules:
+                m = meta.get(r.index) or self._rule_defaults(kind, r.index)
+                r.name = m["name"]
+                if r.targets is None:
+                    r.targets = m["targets"]
+            log.debug("%s: %s rules read by the client: %s", self.tag, kind, [r.index for r in rules])
             await self.send(msg.reply(200, payload=hs.rules_xml(kind, rules)))
             return True
         log.info("%s: %s rule written by the client:\n%s", self.tag, kind, msg.payload_text)
@@ -436,14 +433,7 @@ class BcSession:
         self.cam.settings.put(key, hs.meta_doc(meta))
         log.info("%s: %s rule %d %s on the camera", self.tag, kind, rule.index + 1,
                  "removed" if op == "delete" else "written")
-        # The NVR reads the rules only when it logs in and does not show its own write: the rules as they
-        # are now go with the answer, in case it takes them from there
-        try:
-            payload = hs.rules_xml(kind, await self._camera_rules(kind, meta))
-        except Exception as e:  # noqa: BLE001 - written all the same
-            log.debug("%s: %s rules after the write: %s", self.tag, kind, e)
-            payload = b""
-        await self.send(msg.reply(200, payload=payload))
+        await self.send(msg.reply(200))
         return True
 
     # ------------------------------------------------- settings that reach the source camera

@@ -99,7 +99,7 @@ sh /data/bcproxy/app/deploy/install.sh
 
 - Hikvision's `regionID` (from 1) maps to the Reolink zone number `zone` (from 0).
 - One-shot alerts such as line crossing are held for `hold.smart` seconds, so the NVR has time to start recording; VMD clears immediately on `inactive`.
-- Whether the NVR considers a camera capable of these features depends on `<aitype>` (bit 1 = people, bit 2 = vehicle, bit 4 = dog/cat) and `<smartAI>` (bit 1 = line crossing, bit 2 = intrusion, bit 3 = loitering) in `<Support>` of msg 199. Both values are generated from `ai_types` and `smart` in the config, and so are the zone lists of msg 527/529/531.
+- Whether the NVR considers a camera capable of these features depends on `<aitype>` (bit 1 = people, bit 2 = vehicle, bit 4 = dog/cat) and `<smartAI>` (bit 1 = line crossing, bit 2 = intrusion, bit 3 = loitering) in `<Support>` of msg 199. Both values are generated from `ai_types` and `smart` in the config. The rule lists of msg 527/529 come from the Hikvision camera when it has line crossing / intrusion detection, otherwise from `smart` like the loitering list of 531.
 
 ## Compatibility status
 
@@ -117,6 +117,7 @@ Tested on a real Reolink NVR and the Reolink mobile app (Hikvision 2688×1520 H.
 | App settings pages | 🟡 To verify | 37 ports, 42 email, 46 motion detection, 52 privacy mask, 76 network, 112 streams, 120 online users, 132 image; formats follow real captures |
 | Stream resolution | 🟡 To verify in the app | 146 lists all main stream resolutions Hikvision offers (the sub stream is fixed, as on real cameras); writing 57 changes Hikvision's resolution, frame rate and bitrate and reconnects the video. The app's `videoEncType` and `encoderType` are unreliable and ignored |
 | Recording settings page | 🟡 To verify in the app | 81/82 ↔ Hikvision's recording schedule (Normal = CMR, other types = EDR), 54/55 ↔ overwrite, pre-record, post-record |
+| Line crossing / intrusion rules | ✅ Verified on a G1 (DS-2CD2347G1-L) | 527/528 ↔ `/ISAPI/Smart/LineDetection`, 529/530 ↔ `FieldDetection`: the NVR shows the camera's own lines and areas, and adding, changing and removing them reaches the camera (points, arrow direction, sensitivity, stay time; targets on AcuSense models). Polylines and areas with a point count the camera does not take are refused. The NVR reads the rules only when it connects, so after a change it shows the old shape until it reconnects. See [`bcproxy/hiksmart.py`](bcproxy/hiksmart.py) |
 | Advanced network settings page | 🟡 To verify in the app | 40/97/210/455, only stored in the proxy, Hikvision's network is not changed |
 | Tamper Alert | 🟡 To verify in the app | Bit 25 of `aitype` in 199 declares it, 763/764 read and write Hikvision's tamper detection switch; Hikvision's `shelteralarm` is reported as `tamper` |
 | Manual light | 🟡 To verify in the app | 288 → Hikvision supplementLight, back to the previous mode after `light_seconds` (default 30 s), 291 pushes the state |
