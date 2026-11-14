@@ -285,7 +285,7 @@ Cloud Key 上的开销（Cortex-A53，用录像实测）：1.8 Mbps 的主码流
 
 用 Backyard、Camera23、MainDoor（旋转画面，1520×2688）和 MountainView（DS-2CD2347G2-LU）的录像验证过：每帧都合并成功；ffmpeg 解码合并后的码流，逐帧和原来相同（`framemd5`）；一个 IDR slice 的 bin 序列和 libde265 完全一致；用 Reolink Client 里 Reolink 的 mp4 封装代码转换 250 帧的 GOP，合并后的 mp4 一帧不少，未合并的码流转出来没有视频；在 AddressSanitizer 和 UBSan 下喂 6000 帧被破坏的数据，不崩溃也不泄漏内存。
 
-库按 CPU 分别编译，从 `bcproxy/native/libhevcmerge-<cpu>.so` 加载。`bcproxy/native/build.sh` 为当前机器编译，`build.sh aarch64` 为 Cloud Key 编译（需要 `gcc-aarch64-linux-gnu`；库不存在或比源码旧时，`deploy/push.sh` 会提醒）。Docker 镜像会自动编译。没有库时（例如在 Windows 上）不合并。在 `config.yaml` 里写 `merge_tiles: false` 可以关掉合并。
+库按 CPU 分别编译，从 `bcproxy/native/libhevcmerge-<cpu>.so` 加载。`bcproxy/native/build.sh` 为当前机器编译，`build.sh aarch64` 为 Cloud Key 编译（需要 `gcc-aarch64-linux-gnu`；库不存在或比源码旧时，`deploy/push.sh` 会提醒）。Docker 镜像会自动编译。没有库时（例如在 Windows 上）不合并。库对系统只需要 glibc 2.17 的符号，和加载它的 Python 一样，而且和代理的其他文件一起放在 `/data` 下，固件更新后仍能使用。万一加载失败，日志里记一次，合并关闭，代理照常运行，像以前一样请求关键帧。在 `config.yaml` 里写 `merge_tiles: false` 可以关掉合并。
 
 ### 文件结构
 

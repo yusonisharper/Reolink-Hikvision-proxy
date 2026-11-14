@@ -147,3 +147,15 @@ def test_corrupt_slice_is_left_alone():
     m = hevcmerge.TileMerger(verify=True)
     assert m.merge(bytes(idr)) is None
     assert m.failed and m.merged == 0
+
+
+def test_library_that_cannot_load_turns_merging_off(monkeypatch, tmp_path):
+    # e.g. after a firmware update that broke it: the proxy keeps running, merging off
+    bad = tmp_path / "libhevcmerge-test.so"
+    bad.write_bytes(b"not a library")
+    monkeypatch.setattr(hevcmerge, "_lib", None)
+    monkeypatch.setattr(hevcmerge, "_lib_error", None)
+    monkeypatch.setattr(hevcmerge, "library_path", lambda machine=None: str(bad))
+    assert not hevcmerge.available()
+    assert hevcmerge.stream_merger("x", "H265") is None
+    assert hevcmerge.TileMerger("x").merge(b"\x00\x00\x00\x01\x26\x01") is None

@@ -31,6 +31,13 @@
 #include <string.h>
 #include <pthread.h>
 
+/* glibc 2.34 moved the pthread calls into libc under new symbol versions. Bind to the original ones, so
+ * that the library needs no newer glibc than the Python that loads it (python-build-standalone: 2.17). */
+#if defined(__GLIBC__) && defined(__aarch64__)
+__asm__(".symver pthread_create,pthread_create@GLIBC_2.17");
+__asm__(".symver pthread_join,pthread_join@GLIBC_2.17");
+#endif
+
 #ifdef _WIN32
 #define API __declspec(dllexport)
 #else
