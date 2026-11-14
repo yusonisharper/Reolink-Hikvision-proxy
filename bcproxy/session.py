@@ -258,7 +258,9 @@ class BcSession:
         if msg.msg_id in QUIET_OK:
             await self.send(msg.reply(200))
             return
-        first = msg.msg_id not in self.warned
+        # Smart-rule writes (528/530/532) are logged in full every time: they are not connected yet,
+        # and each one is a sample of the rule format
+        first = msg.msg_id not in self.warned or (is_write and msg.msg_id - 1 in SMART_MSG)
         self.warned.add(msg.msg_id)
         (log.warning if first else log.debug)("%s: unhandled msg %d (%s) -> %d\n%s%s", self.tag, msg.msg_id,
                     "write" if is_write else "read", 200 if is_write else self.cam.unknown_reply,
