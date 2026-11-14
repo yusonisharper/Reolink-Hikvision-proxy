@@ -104,20 +104,38 @@ async def _errors(proc) -> str:
     return proc.stderr_tail.decode(errors="replace").strip()
 
 
-async def _read_live(name: str, proc, size: int) -> bytes:
-    """Reads from ffmpeg. A silent source counts as ended, and the caller starts a new ffmpeg."""
-    # asyncio.wait, not wait_for: see read_access_units
-    read = asyncio.ensure_future(proc.stdout.read(size))
-    try:
-        done, _ = await asyncio.wait({read}, timeout=STALL_SECONDS)
-    finally:
-        if not read.done():
-            read.cancel()
-    if done:
-        return read.result()
-    log.warning("%s: no data for %.0f s, restarting ffmpeg", name, STALL_SECONDS)
-    proc.kill()
-    return b""
+class _LiveReader:
+    """Reads from a live ffmpeg. A silent source counts as ended: the reader kills its ffmpeg, the
+    read returns b"", and the caller starts a new ffmpeg. One watchdog per ffmpeg that wakes about
+    every STALL_SECONDS, not a timeout per read: those cost more than parsing what was read."""
+
+    def __init__(self, name: str, proc) -> None:
+        self.name, self.proc = name, proc
+        self.last = time.monotonic()
+        self._watch = asyncio.create_task(self._watchdog(), name=f"stall-{name}")
+
+    async def read(self, size: int) -> bytes:
+        data = await self.proc.stdout.read(size)
+        self.last = time.monotonic()
+        return data
+
+    async def _watchdog(self) -> None:
+        while self.proc.returncode is None:
+            left = self.last + STALL_SECONDS - time.monotonic()
+            if left <= 0:
+                log.warning("%s: no data for %.0f s, restarting ffmpeg", self.name, STALL_SECONDS)
+                self.proc.kill()
+                # The pipe closing ends the waiting read. Should it stay open (a child of ffmpeg holding
+                # it), end the read here; not at once, as data still on its way would then meet a closed reader.
+                killed_at = self.last
+                await asyncio.sleep(5)
+                if self.last == killed_at:
+                    getattr(self.proc.stdout, "feed_eof", lambda: None)()
+                return
+            await asyncio.sleep(left)
+
+    def close(self) -> None:
+        self._watch.cancel()
 
 
 async def probe(url: str, ffprobe: str = "ffprobe", timeout: float = 15) -> StreamInfo:
@@ -265,9 +283,10 @@ class AudioSource:
                 ["-vn", "-map", "0:a:0", "-c:a", "aac", "-b:a", "32k", "-ar", "16000", "-ac", "1", "-f", "adts", "pipe:1"],
                 rtsp={"allowed_media_types": "audio"}, file_args=("-re",))
             buf = bytearray()
+            live = _LiveReader(self.name, proc)
             try:
                 assert proc.stdout
-                while data := await _read_live(self.name, proc, 4096):
+                while data := await live.read(4096):
                     buf += data
                     for frame in split_adts(buf):
                         for q in list(self.subs):
@@ -277,6 +296,7 @@ class AudioSource:
                 proc.kill()
                 raise
             finally:
+                live.close()
                 if proc.returncode is None:
                     proc.kill()
                     await proc.wait()
@@ -421,10 +441,11 @@ class StreamSource:
             parser = AnnexBParser(info.codec)
             sps_type, sps = (7 if info.codec == "H264" else 33), None
             log.info("%s: ffmpeg started (pid %s)", self.name, proc.pid)
+            live = _LiveReader(self.name, proc)
             try:
                 assert proc.stdout
                 while True:
-                    data = await _read_live(self.name, proc, 65536)
+                    data = await live.read(65536)
                     if not data:
                         break
                     self.rate.add(len(data))
@@ -450,6 +471,7 @@ class StreamSource:
                 proc.kill()
                 raise
             finally:
+                live.close()
                 if proc.returncode is None:
                     proc.kill()
                     await proc.wait()

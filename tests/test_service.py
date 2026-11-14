@@ -440,7 +440,8 @@ class _FakeFfmpeg:
         if self.chunks:
             return self.chunks.pop(0)
         if self.silent and not self.killed:
-            await asyncio.Event().wait()
+            self._gone = asyncio.Event()
+            await self._gone.wait()          # killed: the pipe closes
         return b""
 
     async def _err(self):
@@ -448,6 +449,8 @@ class _FakeFfmpeg:
 
     def kill(self):
         self.killed, self.returncode = True, -9
+        if getattr(self, "_gone", None):
+            self._gone.set()
 
     async def wait(self):
         return self.returncode
@@ -516,10 +519,18 @@ def test_a_stream_that_keeps_coming_is_left_alone(monkeypatch):
     monkeypatch.setattr(media, "STALL_SECONDS", 0.5)
     proc = _FakeFfmpeg([b"a", b"b"])
 
-    async def run():
-        return [await media._read_live("t", proc, 10), await media._read_live("t", proc, 10)]
+    proc.chunks = [b"a", b"b", b"c"]
 
-    assert asyncio.run(run()) == [b"a", b"b"] and not proc.killed
+    async def run():
+        live = media._LiveReader("t", proc)
+        got = []
+        for _ in range(3):        # 0.9 s in all, each chunk well within the limit
+            await asyncio.sleep(0.3)
+            got.append(await live.read(10))
+        live.close()
+        return got
+
+    assert asyncio.run(run()) == [b"a", b"b", b"c"] and not proc.killed
 
 
 def test_noisy_stderr_does_not_block_ffmpeg():

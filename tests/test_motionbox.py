@@ -494,3 +494,26 @@ def test_config(tmp_path, text, expected):
     f = tmp_path / "c.yaml"
     f.write_text(f"cameras:\n  - name: a\n    hik:\n      host: h\n      {text}\n", encoding="utf-8")
     assert config.load(str(f)).cameras[0].motion_boxes is expected
+
+
+@pytest.mark.parametrize("chunk", [1, 3, 100, 70000])
+def test_ws_reader_takes_frames_however_the_bytes_arrive(chunk):
+    payloads = [(2, bytes(range(256)) * 5), (1, b'{"statusCode": 1}'), (9, b""), (2, bytes(70000))]
+    wire = b""
+    for op, data in payloads:
+        n = len(data)
+        size = bytes([n]) if n < 126 else (b"~" + struct.pack(">H", n) if n < 65536 else b"" + struct.pack(">Q", n))
+        wire += bytes([0x80 | op]) + size + data
+
+    async def run():
+        r = asyncio.StreamReader()
+        for i in range(0, len(wire), chunk):
+            r.feed_data(wire[i:i + chunk])
+        r.feed_eof()
+        ws = motionbox.WsReader(r)
+        got = [await ws.next(1) for _ in payloads]
+        with pytest.raises(asyncio.IncompleteReadError):
+            await ws.next(1)
+        return got
+
+    assert asyncio.run(run()) == payloads

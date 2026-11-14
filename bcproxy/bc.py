@@ -14,11 +14,12 @@ Header (little endian):
 """
 from __future__ import annotations
 
+import functools
 import re
 import struct
 from dataclasses import dataclass, field
 
-from .crypto import Crypter
+from .crypto import Crypter, aes_encrypt
 
 MAGIC = 0x0ABCDEF0          # client (app / neolink) <-> camera
 MAGIC_REV = 0x0FEDCBA0      # Reolink NVR <-> camera; the camera must answer with the same magic
@@ -103,31 +104,35 @@ def xml_value(text: bytes | str, tag: str) -> str | None:
     return m.group(1).strip() if m else None
 
 
+@functools.lru_cache(maxsize=64)
+def _full_aes_ext(key: bytes, ext_plain: bytes, encrypt_len: int) -> bytes:
+    """The encrypted extension of a full AES binary payload: the same for nearly every chunk of video."""
+    return aes_encrypt(key, add_ext_field(ext_plain, "encryptLen", encrypt_len))
+
+
 def encode(msg: BcMsg, crypter: Crypter, magic: int = MAGIC) -> bytes:
     off = msg.channel
     if msg.cls == CLASS_LEGACY:
-        body = msg.payload
+        parts = [msg.payload]
         ext_len = None
     else:
-        ext_plain = msg.ext
         if msg.binary and msg.payload and crypter.full_aes and msg.msg_id != MSG_LOGIN:
-            # Full AES: binary payload encrypted, length announced in the extension.
-            # (Verified with a real Reolink NVR + app. Real cameras additionally send
-            # checkPos/checkValue and encrypt only 1024 bytes; not needed so far.)
-            ext_plain = add_ext_field(ext_plain, "encryptLen", len(msg.payload))
-            pay = crypter.encrypt(msg.msg_id, off, msg.payload)
-        elif msg.binary:
-            pay = msg.payload  # media/jpeg in clear (aes / bc / none)
+            # Full AES: the whole binary payload encrypted, its length announced in the extension.
+            # Real cameras encrypt only the first 1024 bytes and add checkPos/checkValue; <encryptLen>1024
+            # without those gave a Reolink NVR no picture at all (2026-11-13), so all of it stays encrypted.
+            ext = _full_aes_ext(crypter.aes_key, msg.ext, len(msg.payload))
+            parts = [ext, crypter.encrypt(msg.msg_id, off, msg.payload)]
         else:
-            pay = crypter.encrypt(msg.msg_id, off, msg.payload)
-        ext = crypter.encrypt(msg.msg_id, off, ext_plain)
-        body = ext + pay
+            ext = crypter.encrypt(msg.msg_id, off, msg.ext)
+            # binary: media/jpeg in clear (aes / bc / none)
+            parts = [ext, msg.payload if msg.binary else crypter.encrypt(msg.msg_id, off, msg.payload)]
         ext_len = len(ext) if has_offset(msg.cls) else None
-    hdr = HDR.pack(magic, msg.msg_id, len(body), msg.channel, msg.stream_type,
+    body_len = sum(len(p) for p in parts)
+    hdr = HDR.pack(magic, msg.msg_id, body_len, msg.channel, msg.stream_type,
                    msg.msg_num, msg.response, msg.cls)
     if ext_len is not None:
         hdr += struct.pack("<I", ext_len)
-    return hdr + body
+    return b"".join((hdr, *parts))
 
 
 class Decoder:

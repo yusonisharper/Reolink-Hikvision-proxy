@@ -18,6 +18,7 @@ Reference: neolink crates/core/src/bc/crypto.rs, reolink_aio baichuan.py
 """
 from __future__ import annotations
 
+import functools
 import hashlib
 from enum import IntEnum
 
@@ -78,7 +79,10 @@ def make_aes_key(nonce: str, password: str) -> bytes:
     return md5_hex_upper(f"{nonce}-{password}")[:16].encode("ascii")
 
 
+@functools.lru_cache(maxsize=64)
 def _aes(key: bytes):
+    """One Cipher per key: each message still gets its own encryptor (the cipher restarts from the IV),
+    but building the Cipher for every 32 KB chunk of video cost as much as encrypting it."""
     return Cipher(algorithms.AES(key), CFB(AES_IV))
 
 

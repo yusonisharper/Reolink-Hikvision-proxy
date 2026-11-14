@@ -129,6 +129,8 @@ sh /data/bcproxy/app/deploy/install.sh
 
 实测（2.0 Mbps 主码流）：解析和封装加密约 0.16% 单核，ffmpeg 转发约 2% 单核，音频转码约 1.6% 单核。CPU 不是瓶颈，首帧等待（1.3～2 秒）主要花在 RTSP 和 ffmpeg 分析上。`-fflags nobuffer`、小 `-probesize` 在主码流和回放上出不了画面，不要用。
 
+Cloud Key Gen2 Plus（8 核 Cortex-A53，2.0 GHz）上带 8 台摄像头，NVR 全天看所有主码流和子码流，6 台开 Motion Boxes，一路麦克风：Python 约占 47% 单核，17 个 ffmpeg 合计约 29%，整机 80% 以上空闲。代理是单个 asyncio 进程，上限是一个核，现在的负载还有一倍余量。py-spy 采样看，主要开销是视频的 AES（FULL_AES 整段加密，见技术说明）、事件循环为 ffmpeg 管道和 Motion Boxes 连接的每个 TCP 段醒一次（数据实时到达，一次一个段），以及 H.265/H.264 解析。解析器每个字节只扫一次，读 NAL 头时不再复制整个 NAL；Motion Boxes 按整块读取解析，不再一帧一帧地等；每个 ffmpeg 用一个看门狗代替每次读取的超时。这些改动让代理从 53% 单核降到 47%。
+
 ## 海康 H.265 与 Reolink 下载
 
 有些海康型号把每帧画面分成几个 tile，每个 tile 单独一个 slice：DS-2CD2347G1-L 和 DS-2CD2347G2-LU 的主码流是 3 个，G1 的子码流是 2 个。Reolink 自己的摄像头每帧只有 1 个 slice，Reolink 的部分代码处理不了更多。代理不重新编码，而是绕开这些问题：改写后的码流用 ffmpeg 解码，画面和原来逐帧相同（用 `framemd5` 核对过）。
@@ -163,7 +165,7 @@ Reolink 的 mp4 封装代码（`bc_mp4_*`）在手机 App、Reolink Client（`li
 | Crossroad（DS-2CD4232FWD-IZH8） | ❌ 拿不到会话 token（HTTP 403） |
 | 大华 | ❌ 没有查，已关闭 |
 
-- **成本：** 有人观看时多一条到相机的连接，而 NVR 全天都在看。不解码：代理只读包头和目标列表。BackDoor 子码流约 330 kbps；回退到主码流的相机，会把整路主码流发到代理。Cloud Key 上的 CPU 占用还没测。
+- **成本：** 有人观看时多一条到相机的连接，而 NVR 全天都在看。不解码：代理只读包头和目标列表。BackDoor 子码流约 330 kbps；回退到主码流的相机，会把整路主码流发到代理。Cloud Key 上 6 台摄像头的这条连接约占 7% 单核，主要是事件循环为每个 TCP 段醒一次。
 - **依赖：** 相机的 WebSocket 服务要开着。用 `motion_boxes: false` 关闭此功能。
 - **延迟：** 框和视频走不同的连接，没有逐帧对齐。
 - **没有覆盖：** 回放还没有框。`ISAPI/ContentMgmt/download` 能拿到录像里同样的包，可以从这里开始。
@@ -325,7 +327,7 @@ tests/          协议测试（使用 neolink 的真机样本）+ 端到端测�
 - **码率模式**：App 的 Bitrate Mode 不走 57，而是图像消息 25 里的 `encType`（真机抓包），对应海康两路码流的 CBR/VBR。
 - **能力位**：App 按 199 的字段决定显示哪些选项，字段缺失不等于不支持。`binoCfg` 要明确写 0，否则会出现 Duo 系列才有的 Sync Brightness。`newIspCfg` 各位含义：0 日夜、1 防闪烁、2 曝光、8 亮度、9 对比度、10 饱和度、11 色调、12 锐度（来自 reolink_aio）。这里用 5891，只声明已接到海康的项。
 - **包头 magic**：Reolink NVR 用 `0x0FEDCBA0`（`a0 cb ed 0f`），App 和 neolink 用 `0x0ABCDEF0`。摄像头必须用对端发来的那个 magic 回复，否则 NVR 会丢掉回复，约 200 ms 后断开，界面上显示为“连接超时”。
-- **加密**：NVR 请求 FULL_AES（`0xdc12`），降级到 AES（0x02）会被直接断开。二进制载荷（视频、JPEG）整段加密，扩展头里带 `<encryptLen>`。真机还会带 `checkPos/checkValue`，并且只加密前 1024 字节；我们不这么做，NVR 和 App 也能正常解码。
+- **加密**：NVR 请求 FULL_AES（`0xdc12`），降级到 AES（0x02）会被直接断开。二进制载荷（视频、JPEG）整段加密，扩展头里带 `<encryptLen>`。真机写成 `<EncryptLen>`，还会带 `checkPos/checkValue`，并且只加密前 1024 字节。2026-11-13 试过：`<encryptLen>1024`、其余明文（不带 checkPos/checkValue，小写标签），NVR 一直开着所有预览，却没有画面，录像也停了。很可能它不认我们的小写标签，整段都当密文解；只改成大写标签还没试过。所以仍然整段加密，NVR 和 App 都能正常解码。
 - **局域网搜索**：NVR 每 2 秒从 UDP 3000 向 `255.255.255.255:2000` 广播 4 字节 `aa aa 00 00`，Reolink Client 也这样搜索。设备回复一个 388 字节的定长结构（IP、端口、名称、MAC、UID，字段偏移见 `bcproxy/discovery.py`）。回复**固定发到对方的 UDP 3000**，与请求的源端口无关。代理在 `0.0.0.0:2000` 上监听，每收到一次搜索，就为每台虚拟摄像头各回一个包。`tools/bc_discover.py` 可以列出局域网里的真机和虚拟摄像头。
 - **设置消息**：NVR/App 写入的设置（25/45/57/105/209/297，以及“读 N、写 N+1”这种配对）会合并到对应的读取回复里，保存到 `state_dir/<camera>/<id>.xml`，删掉文件即可恢复默认。
 - **实时预览的帧时间**：帧时间一旦倒退，Reolink App 的实时预览就会永久卡住。帧时间用设备开机以来的微秒数，和真机一样：低 32 位放在 `micros`，高位放在帧头最后一个字段（真机在这里发 0x1、0x47）。以前低 32 位每 71.6 分钟回绕一次，预览就会卡住。测试时可以用 `debug_wrap_in`（秒）把下一次回绕提前到这么久之后。

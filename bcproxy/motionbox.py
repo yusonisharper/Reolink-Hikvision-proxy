@@ -38,6 +38,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import collections
 import json
 import logging
 import os
@@ -216,14 +217,46 @@ def _ws_frame(payload: bytes, opcode: int) -> bytes:
     return head + mask + bytes(c ^ mask[i % 4] for i, c in enumerate(payload))
 
 
-async def _ws_read(reader: asyncio.StreamReader) -> tuple[int, bytes]:
-    first, second = await reader.readexactly(2)
-    size = second & 0x7F
-    if size == 126:
-        size = struct.unpack(">H", await reader.readexactly(2))[0]
-    elif size == 127:
-        size = struct.unpack(">Q", await reader.readexactly(8))[0]
-    return first & 0x0F, await reader.readexactly(size)
+class WsReader:
+    """Frames of a server's WebSocket stream (unmasked, unfragmented: what the camera sends), parsed
+    from large reads. The camera sends every RTP packet of the video as its own frame, a hundred and
+    more a second: reading each with its own awaits cost more than all else the proxy does with them."""
+
+    def __init__(self, reader: asyncio.StreamReader) -> None:
+        self.reader = reader
+        self.buf = bytearray()
+        self.ready: collections.deque[tuple[int, bytes]] = collections.deque()
+
+    async def next(self, timeout: float) -> tuple[int, bytes]:
+        """(opcode, payload). asyncio.TimeoutError when nothing came for timeout seconds,
+        IncompleteReadError when the stream ended."""
+        while not self.ready:
+            data = await asyncio.wait_for(self.reader.read(65536), timeout)
+            if not data:
+                raise asyncio.IncompleteReadError(bytes(self.buf), None)
+            self.buf += data
+            self._parse()
+        return self.ready.popleft()
+
+    def _parse(self) -> None:
+        buf, pos, n = self.buf, 0, len(self.buf)
+        while n - pos >= 2:
+            size, head = buf[pos + 1] & 0x7F, 2
+            if size == 126:
+                if n - pos < 4:
+                    break
+                size, head = (buf[pos + 2] << 8) | buf[pos + 3], 4
+            elif size == 127:
+                if n - pos < 10:
+                    break
+                size, head = int.from_bytes(buf[pos + 2:pos + 10], "big"), 10
+            end = pos + head + size
+            if end > n:
+                break
+            self.ready.append((buf[pos] & 0x0F, bytes(buf[pos + head:end])))
+            pos = end
+        if pos:
+            del buf[:pos]
 
 
 class CameraRefused(Exception):
@@ -323,13 +356,14 @@ class CameraTargets:
             head = await asyncio.wait_for(reader.readuntil(b"\r\n\r\n"), 6)
             if b" 101 " not in head.split(b"\r\n", 1)[0]:
                 raise CameraRefused(head.split(b"\r\n", 1)[0].decode("latin1"))
-            await asyncio.wait_for(_ws_read(reader), 6)      # its version and cipher
+            ws = WsReader(reader)
+            await ws.next(6)      # its version and cipher
             writer.write(_ws_frame(json.dumps(
                 {"sequence": 0, "cmd": "realplay", "url": f"live://{self.host}:{self.port}/1/{stream}",
                  "key": "", "authorization": "", "token": token}).encode(), 1))
             await writer.drain()
             while True:
-                opcode, data = await asyncio.wait_for(_ws_read(reader), IDLE_SECONDS)
+                opcode, data = await ws.next(IDLE_SECONDS)
                 if opcode == 2:
                     packet = rtp_private_packet(data)
                     if packet is not None:

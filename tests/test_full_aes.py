@@ -26,7 +26,7 @@ def test_encode_binary_full_aes_roundtrip():
     data = __import__('os').urandom(2560)
     first = bc.encode(BcMsg(3, 0, 0, 7, 200, bc.CLASS_MODERN, ext_xml(binaryData=1), data, True), tx)
     nxt = bc.encode(BcMsg(3, 0, 0, 7, 200, bc.CLASS_MODERN, b"", data[:100], True), tx)
-    assert data not in first                       # payload really encrypted on the wire
+    assert data[:16] not in first and data[-16:] not in first     # all of the payload encrypted
     d = bc.Decoder(rx)
     d.feed(first + nxt)
     m1, m2 = list(d.messages())

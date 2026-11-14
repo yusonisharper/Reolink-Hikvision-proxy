@@ -116,3 +116,26 @@ def test_annexb_access_units_h264():
     aus = parser.feed(sps + pps + idr + p1 + p2 + sps + idr)
     assert [a.keyframe for a in aus] == [True, False, False]
     assert aus[0].data.startswith(sps + pps)
+
+
+def test_annexb_parser_gives_the_same_pictures_however_the_bytes_arrive():
+    """The splitter goes on where it stopped: a start code cut between two reads, a 4-byte one whose
+    first zero came in the read before, and trailing zeros must all come out as with one read."""
+    sps = b"\x00\x00\x00\x01\x67\x42\x00\x1f"
+    pps = b"\x00\x00\x01\x68\xce\x38\x80"
+    idr = b"\x00\x00\x00\x01\x65\x88" + bytes(range(1, 250)) * 40 + b"\x00\x00"   # trailing_zero_8bits
+    p = b"\x00\x00\x01\x41\x9a" + bytes(range(1, 200)) * 3
+    stream = (sps + pps + idr + p + p) * 3 + sps
+
+    def pictures(chunk):
+        parser = bcmedia.AnnexBParser("H264")
+        out = []
+        for i in range(0, len(stream), chunk):
+            out += parser.feed(stream[i:i + chunk])
+        return [(a.data, a.keyframe, a.slices) for a in out]
+
+    whole = pictures(len(stream))
+    assert len(whole) == 8 and [k for _, k, _ in whole[:3]] == [True, False, False]   # the last waits for more
+    assert not whole[0][0].endswith(b"\x00")
+    for chunk in (1, 2, 3, 5, 64, 1000):
+        assert pictures(chunk) == whole

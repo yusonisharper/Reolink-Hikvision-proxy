@@ -104,32 +104,63 @@ class AccessUnit:
     slices: int = 1      # VCL NAL units (slices) in the picture
 
 
+NO_START_CODE_LIMIT = 1 << 20    # bytes kept while no start code has come at all
+
+
+class _NalSplitter:
+    """Annex-B bytes -> complete NAL units (with 4-byte start codes). Scans each byte once: a NAL unit
+    of a big keyframe arrives over many reads, and searching it again from its start for every read
+    cost more than the rest of the parsing."""
+
+    def __init__(self) -> None:
+        self.buf = bytearray()
+        self.nal = -1       # where the payload of the unfinished NAL unit starts in buf (-1: none yet)
+        self.scan = 0       # where the search for the next start code goes on
+
+    def feed(self, data: bytes) -> list[bytes]:
+        buf = self.buf
+        buf += data
+        out = []
+        i, nal, begin = self.scan, self.nal, 0
+        find = buf.find
+        while (j := find(b"\x00\x00\x01", i)) >= 0:
+            s = j - 1 if j > 0 and buf[j - 1] == 0 else j
+            if nal >= 0:
+                # rstrip: trailing_zero_8bits (Dahua pads with them) are not part of a NAL unit. A Reolink
+                # NVR plays them, but the mp4 it makes for a download then has no I frames.
+                out.append(b"\x00\x00\x00\x01" + buf[nal:s].rstrip(b"\x00"))
+            begin, nal = s, j + 3
+            i = nal
+        if nal < 0 and len(buf) > NO_START_CODE_LIMIT:
+            begin = len(buf) - 3
+        if begin:
+            del buf[:begin]          # cheap: CPython moves the start of a bytearray instead of copying
+            i -= begin
+            if nal >= 0:
+                nal -= begin
+        self.nal = nal
+        self.scan = max(i, len(buf) - 2, 0)   # a start code can begin in the last two bytes
+        return out
+
+    @property
+    def rest(self) -> bytes:
+        return bytes(self.buf)
+
+
 def _split_nals(buf: bytes) -> tuple[list[bytes], bytes]:
     """Return complete NAL units (with 4-byte start codes) and the remainder."""
-    starts = []
-    i, n = 0, len(buf)
-    while i + 3 <= n:
-        j = buf.find(b"\x00\x00\x01", i)
-        if j < 0:
-            break
-        s = j - 1 if j > 0 and buf[j - 1] == 0 else j
-        starts.append((s, j + 3))
-        i = j + 3
-    if len(starts) < 2:
-        return [], buf
-    # rstrip: trailing_zero_8bits (Dahua pads with them) are not part of a NAL unit. A Reolink NVR plays
-    # them, but the mp4 it makes for a download then has no I frames.
-    nals = [b"\x00\x00\x00\x01" + buf[starts[k][1]:starts[k + 1][0]].rstrip(b"\x00") for k in range(len(starts) - 1)]
-    return nals, buf[starts[-1][0]:]
+    s = _NalSplitter()
+    return s.feed(buf), s.rest
 
 
 class AnnexBParser:
     def __init__(self, codec: str) -> None:
         assert codec in ("H264", "H265")
         self.codec = codec
-        self.rem = b""
-        self.cur: list[bytes] = []
-        self.cur_has_vcl = False
+        self.splitter = _NalSplitter()
+        self.cur: list[bytes] = []          # NAL units of the access unit being collected
+        self.cur_types: set[int] = set()    # their types
+        self.cur_slices = 0                 # their VCL NAL units
         self.cur_key = False
         self.params: dict[int, bytes] = {}   # nal type -> latest VPS/SPS/PPS
         self.flat_ok: dict[bytes, bool] = {}       # H.265 SPS -> may declare one sub-layer (hevcps)
@@ -137,18 +168,19 @@ class AnnexBParser:
 
     # -- NAL classification ---------------------------------------------------
     def _info(self, nal: bytes) -> tuple[int, bool, bool, bool]:
-        """(type, is_vcl, is_key, first_slice_of_picture)"""
-        h = nal[4:]
-        if not h:
+        """(type, is_vcl, is_key, first_slice_of_picture). Indexes nal: a slice copied to read
+        its header would copy the whole picture."""
+        n = len(nal)
+        if n <= 4:
             return -1, False, False, False
         if self.codec == "H264":
-            t = h[0] & 0x1F
+            t = nal[4] & 0x1F
             vcl = 1 <= t <= 5
-            first = vcl and len(h) > 1 and bool(h[1] & 0x80)   # first_mb_in_slice == 0
+            first = vcl and n > 5 and bool(nal[5] & 0x80)   # first_mb_in_slice == 0
             return t, vcl, t == 5, first
-        t = (h[0] >> 1) & 0x3F
+        t = (nal[4] >> 1) & 0x3F
         vcl = t < 32
-        first = vcl and len(h) > 2 and bool(h[2] & 0x80)       # first_slice_segment_in_pic_flag
+        first = vcl and n > 6 and bool(nal[6] & 0x80)       # first_slice_segment_in_pic_flag
         return t, vcl, 16 <= t <= 23, first
 
     def _is_param(self, t: int) -> bool:
@@ -187,19 +219,18 @@ class AnnexBParser:
 
     # -- feeding --------------------------------------------------------------
     def feed(self, data: bytes) -> list[AccessUnit]:
-        nals, self.rem = _split_nals(self.rem + data)
         out: list[AccessUnit] = []
-        for nal in nals:
+        for nal in self.splitter.feed(data):
             t, vcl, key, first = self._info(nal)
-            starts_new = self.cur_has_vcl and (self._is_aud(t) or first or (not vcl and t not in (-1,)
-                                                                                and self._is_param(t)))
-            if starts_new:
+            param = self._is_param(t)
+            if self.cur_slices and (first or param or self._is_aud(t)):
                 out.append(self._flush())
-            if self._is_param(t):
+            if param:
                 self.params[t] = nal
             self.cur.append(nal)
+            self.cur_types.add(t)
             if vcl:
-                self.cur_has_vcl = True
+                self.cur_slices += 1
                 self.cur_key |= key
         return out
 
@@ -207,11 +238,10 @@ class AnnexBParser:
         nals = self.cur
         key = self.cur_key
         if key:
-            present = {self._info(n)[0] for n in nals}
-            missing = [self.params[t] for t in sorted(self.params) if t not in present]
+            missing = [self.params[t] for t in sorted(self.params) if t not in self.cur_types]
             nals = missing + nals
         if self.codec == "H265":
             nals = self._flatten_sub_layers(nals)
-        au = AccessUnit(b"".join(nals), key, sum(1 for n in nals if self._info(n)[1]))
-        self.cur, self.cur_has_vcl, self.cur_key = [], False, False
+        au = AccessUnit(b"".join(nals), key, self.cur_slices)
+        self.cur, self.cur_types, self.cur_slices, self.cur_key = [], set(), 0, False
         return au
