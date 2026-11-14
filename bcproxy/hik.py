@@ -102,9 +102,13 @@ class DigestAuth:
 
     def challenge(self, www: str) -> None:
         scheme, params = _parse_www_auth(www)
+        same = self.chal is not None and scheme == self.scheme and params.get("nonce") == self.chal.get("nonce")
         self.scheme = scheme
         self.chal = params
-        self.nc = 0
+        if not same:
+            # Concurrent requests can all be challenged with the same nonce: restarting the count
+            # would reuse nc values, which the camera rejects as replays (Dahua: 401)
+            self.nc = 0
 
 
 @dataclass
@@ -196,7 +200,11 @@ class HikHttp:
 
     async def request(self, method: str, path: str, body: bytes | None = None) -> HttpResponse:
         r = await self._send(method, path, body)
-        if r.status == 401 and "www-authenticate" in r.headers:
+        # More than one retry: a concurrent request can replace the nonce between our challenge and
+        # our retry, or reach the camera first with a higher nc
+        for _ in range(3):
+            if r.status != 401 or "www-authenticate" not in r.headers:
+                break
             try:
                 if "content-length" in r.headers:
                     await asyncio.wait_for(r.read_all(), 2)

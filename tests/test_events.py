@@ -90,3 +90,16 @@ def test_alarm_xml_is_parseable_like_reolink():
     assert smart == {"crossline": (0b10, [(1, "vehicle")]), "intrusion": (0b1, [(0, "people")])}
     md, ai, smart = _parse_like_reolink_aio(alarm_event_xml(st.snapshot(now=100)))
     assert not md and ai == "none" and smart == {}
+
+
+def test_digest_keeps_counting_when_challenged_with_the_same_nonce():
+    """Concurrent requests get the same challenge: nc must not repeat under one nonce."""
+    a = hik.DigestAuth("admin", "pw")
+    www = 'Digest realm="Login to x", qop="auth", nonce="n1", opaque="o"'
+    a.challenge(www)
+    first = a.header("GET", "/a")
+    a.challenge(www)
+    second = a.header("GET", "/b")
+    assert "nc=00000001" in first and "nc=00000002" in second
+    a.challenge(www.replace("n1", "n2"))
+    assert "nc=00000001" in a.header("GET", "/c")
