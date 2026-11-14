@@ -8,7 +8,7 @@ import os
 import signal
 import sys
 
-from . import discovery, hik, logsetup, netalias, watchdog
+from . import discovery, hevcmerge, hik, logsetup, netalias, watchdog
 from .camera import VirtualCamera
 from .config import AppConfig, load
 from .session import BcSession
@@ -106,6 +106,7 @@ def main() -> None:
         sys.exit(2)
     if not (a.verbose or a.trace):
         logging.getLogger().setLevel(cfg.log_level.upper())
+    hevcmerge.enabled = cfg.merge_tiles
     try:
         restart = asyncio.run(main_async(cfg, a.trace))
     except Exception:

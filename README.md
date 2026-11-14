@@ -44,6 +44,7 @@ Then add the camera manually in the Reolink NVR: use the IP from `listen`, port 
 Verified on a UCK-G2-Plus (UniFi OS 6.0.11, Debian 13, aarch64). All files live in `/data/bcproxy`, and systemd starts the service at boot. First install (Git Bash, with `UCK-G2-Plus` set up in `~/.ssh/config`):
 
 ```bash
+bcproxy/native/build.sh aarch64   # in WSL or Linux: the H.265 tile merging library for the Cloud Key's CPU
 deploy/push.sh --with-config      # copies code, config.yaml and state/, downloads Python and ffmpeg, starts the service
 deploy/push.sh                    # later code updates: leaves the device's config and state/ alone
 ```
@@ -139,11 +140,12 @@ Some Hikvision models code each picture as several tiles, each in its own slice:
 |---|---|---|
 | VPS/SPS declare 2 temporal sub-layers (G1, even with SVC off) | The NVR's decoder switches to its SVC reference handling and fails on the P frames | Rewrites the VPS/SPS to one sub-layer (`hevcps.single_sub_layer`), only when no reference picture set keeps more than one short-term picture |
 | A VPS/SPS/PPS longer than 64 bytes, start code included (G1 SPS: 64 bytes, 81 with H.265+) | Reolink's mp4 writer gives up: the phone app reports a download error, NVR backups are empty | Drops the VUI HRD parameters from the SPS (`hevcps.fit_mp4_limit`), which gives 47 bytes. Decoders don't use them, and the camera sends no SEI that refers to them |
-| A GOP is written with one `writev()` of at most 600 pieces, two per NAL unit, so pictures per GOP × slices must stay at or below 300 | The writer drops the whole GOP (`v_io_count to big:600`), and the file holds little or no video | Counts the slices per picture and asks the camera for a keyframe (ISAPI `requestKeyFrame`) one second before the limit (`StreamSource._guard_gop`) |
+| A GOP is written with one `writev()` of at most 600 pieces, two per NAL unit, so pictures per GOP × slices must stay at or below 300 | The writer drops the whole GOP (`v_io_count to big:600`), and the file holds little or no video | Merges the slices of each picture into one (`hevcmerge`, see below), which raises the limit to 300 pictures. For a picture that cannot be merged it counts the slices and asks the camera for a keyframe (ISAPI `requestKeyFrame`) one second before the limit (`StreamSource._guard_gop`) |
 
 Reolink's mp4 writer (`bc_mp4_*`) runs in the phone app, in Reolink Client (`libBCSDKWrapper.dll`) and in the NVR's backup. The findings come from running the Windows client's copy on frames captured from the proxy (`tools/bc_client.py --raw`).
 
-- **Cost of the keyframes:** More storage. With 3 slices a GOP holds at most 100 pictures: about 3.2 s at 25 fps, where H.265+ makes up to 10 s. At a lower frame rate the same 100 pictures last longer (6.7 s at 15 fps). Streams that stay below the limit by themselves are left alone. Only Hikvision cameras that accept `requestKeyFrame` are covered.
+- **GOP length:** Merged into one slice, a GOP may hold 300 pictures, 12 s at 25 fps, more than the 10 s that H.265+ makes, so no keyframes are requested. Without merging (no library for the CPU, `merge_tiles: false`, or a stream the merger does not support), 3 slices allow 100 pictures, about 3.2 s at 25 fps (6.7 s at 15 fps), and the extra keyframes cost storage. Streams that stay below the limit by themselves are left alone. Only Hikvision cameras that accept `requestKeyFrame` get keyframe requests.
+- **The camera's own keyframes:** With H.265+ at 20 fps, the G1 makes a keyframe of its own 282 pictures (14.1 s) after the last keyframe, its own or one asked for. Asking one second before the limit gave its own at picture 282 and the answer 6 pictures later: two keyframes where one was enough. So once two GOPs that ended with a keyframe of the camera's own agree in length (within 2%), and that length fits the limit, nothing is asked while a GOP is within it. Shorter GOPs (H.265+ adds keyframes at a sudden change in the picture) teach nothing. A keyframe that comes within 2 s of a request (from the GOP guard or for a new viewer) counts as its answer, unless another one follows within those 2 s. If a GOP goes past the learnt length, the proxy asks at once and learns again; that GOP can end a few pictures past the limit, and the phone then loses those seconds.
 - Recordings made before these fixes still fail to download to the phone. NVR downloads to USB without transcoding were not affected.
 
 ## Motion Boxes
@@ -267,6 +269,24 @@ For Dahua, use `python tools/fake_dahua.py --port 8081` (account `admin` / `dahu
 3. `captured/<id>.xml` takes priority over the built-in templates. Fields such as model and UID can become placeholders like `${model}` and `${uid}`.
 4. With `trace: true`, `unhandled msg N` in the log marks messages that still lack a template. Each ID is warned about once per connection.
 
+### Merging the tiles into one slice
+
+`bcproxy/hevcmerge.py` with the C library `bcproxy/native/hevcmerge.c` turns the 3 slices of a picture into one slice that holds the 3 tiles. Nothing is re-encoded, and the pictures decode to the same pixels:
+
+- The 3 slices of a picture carry the same slice header apart from the slice address.
+- Each tile starts with freshly initialised CABAC contexts and arithmetic decoder, whether it is its own slice or one tile of a bigger slice, and prediction never crosses a tile boundary.
+- In-loop filtering across the old slice boundaries depends on `loop_filter_across_tiles_enabled_flag` alone after the merge. The merge is done only when that gives the same filtering as before.
+
+Two things change in the bitstream. The merged slice header gets entry points (the byte offset of each tile). And each tile except the last one now ends with `end_of_slice_segment_flag` = 0 and `end_of_subset_one_bit` = 1 instead of `end_of_slice_segment_flag` = 1: one more terminate bin before the arithmetic coder flushes, which changes the last bits of the tile. Computing them needs the coder's range at the end of the tile, so the library entropy-decodes every tile: all syntax elements, but no pixels, motion vectors or transforms.
+
+The library supports Main and Main 10, 4:2:0, tiles without WPP, no dependent slice segments and no PPS extensions: what these Hikvision cameras send. Anything else, or a picture that does not decode cleanly, goes out as it came, and the log names the reason once per stream and reason. Each stream merges on a thread of its own, so a big keyframe holds up neither the event loop nor the other cameras, and the tiles of a big picture are decoded in parallel.
+
+Cost on the Cloud Key (Cortex-A53, measured on captures): about 11% of one core for a 1.8 Mbps main stream (Backyard), about 15% at 4.4 Mbps (MainDoor), about 1% for a G1 sub stream. The largest keyframe seen, 826 KB, takes 88 ms; the camera needs about 0.4 s to send it.
+
+Checked on captures from Backyard, Camera23, MainDoor (rotated, 1520×2688) and MountainView (DS-2CD2347G2-LU): every picture merged; ffmpeg decodes the merged streams to the same frames (`framemd5`); the bin sequence of an IDR slice matches libde265's; Reolink's mp4 writer from Reolink Client turns a merged GOP of 250 pictures into an mp4 with every frame, where the unmerged stream gives a file with no video; 6000 corrupted pictures under AddressSanitizer and UBSan neither crash nor leak.
+
+The library is built per CPU and loaded from `bcproxy/native/libhevcmerge-<cpu>.so`. `bcproxy/native/build.sh` builds it for the machine it runs on, `build.sh aarch64` for the Cloud Key (needs `gcc-aarch64-linux-gnu`; `deploy/push.sh` warns when it is missing or older than the source). The Docker image builds it. Without the library (on Windows, for example) nothing is merged. `merge_tiles: false` in `config.yaml` turns merging off.
+
 ### Project layout
 
 ```
@@ -275,6 +295,7 @@ bcproxy/
   bc.py         Baichuan frame codec (header, magic, extension XML, binary mode, FULL_AES)
   bcmedia.py    BcMedia container (InfoV2 / I frame / P frame / AAC), Annex-B access unit splitting
   hevcps.py     H.265 VPS/SPS rewrites for the NVR and for Reolink's mp4 writer
+  hevcmerge.py  Merges the tile slices of an H.265 picture into one slice (C library in native/)
   session.py    Server session: login negotiation, template replies, settings writes, alert subscription (31/33), preview (3/4), snapshot (109)
   camera.py     Virtual camera: Hikvision events → state machine → push; capability bits, renaming, Hikvision status polling
   discovery.py  LAN discovery replies (UDP 2000 → 3000)

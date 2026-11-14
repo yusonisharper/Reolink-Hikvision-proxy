@@ -22,6 +22,7 @@ class AppConfig:
     listen_port: int | None = None    # Hikvision HTTP push receiver
     discovery: tuple[str, int] | None = ("0.0.0.0", 2000)   # Reolink LAN search responder
     alias_interface: str | None = None   # add the cameras' listen addresses to this interface
+    merge_tiles: bool = True          # H.265 pictures in several slices leave as one (hevcmerge)
     extra: dict = field(default_factory=dict)
 
 
@@ -108,4 +109,5 @@ def load(path: str) -> AppConfig:
         log_level=raw.get("log_level", "info"), trace=bool(raw.get("trace", False)),
         listen_host=lh or "0.0.0.0", listen_port=lp, discovery=discovery,
         alias_interface=raw.get("alias_interface"),
+        merge_tiles=bool(raw.get("merge_tiles", True)),
     )

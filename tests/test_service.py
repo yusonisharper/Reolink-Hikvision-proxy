@@ -686,9 +686,11 @@ def _camera_for_keyframes(can_ask):
     def source(name):
         async def poke():
             calls.append(("rtsp", name))
-        return SimpleNamespace(request_keyframe=poke)
+        return SimpleNamespace(request_keyframe=poke, note_keyframe_request=lambda: noted.append(name))
+    noted = []
     cam.hikcfg = SimpleNamespace(can_request_keyframe=can_ask, request_keyframe=ask)
     cam.main, cam.sub = source("main"), source("sub")
+    cam.noted = noted                  # the stream is told, so that its GOP guard knows the next keyframe
     return cam, calls
 
 
@@ -703,6 +705,7 @@ def test_camera_with_a_keyframe_call_keeps_using_it():
     cam, calls = _camera_for_keyframes(True)
     asyncio.run(cam.request_keyframe("subStream"))
     assert calls == [("isapi", 2)]
+    assert cam.noted == ["sub"]
 
 
 def _h265_key(sps: bytes) -> bytes:

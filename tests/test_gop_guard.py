@@ -82,3 +82,97 @@ def test_parser_counts_slices():
     # a picture is complete when the next one starts; the last NAL unit waits for the next start code
     aus = p.feed(SC + first + SC + other + SC + other + SC + first + SC + first + SC)
     assert [a.slices for a in aus] == [3, 1]
+
+
+def _camera(gop: int, pictures: int, fps: int = 20, slices: int = 1, answer_after: int = 13,
+            fixed: bool = False, viewer_asks: tuple[int, ...] = (), stop_after: int | None = None,
+            extras: tuple[int, ...] = (), jitter: tuple[int, ...] = (), monkeypatch=None) -> list[int]:
+    """A camera that makes a keyframe of its own `gop` pictures after the last keyframe, any keyframe
+    (DS-2CD2347G1-L, H.265+: 282 at 20 fps), or every `gop` pictures whatever happens (fixed), and
+    answers a request `answer_after` pictures later. Returns the picture numbers that asked."""
+    import bcproxy.media as media
+    clock = [0.0]
+    monkeypatch.setattr(media.time, "monotonic", lambda: clock[0])
+    asked: list[int] = []
+
+    async def main() -> None:
+        src = StreamSource("t/main", "rtsp://x", StreamInfo("H265", 2688, 1520, fps))
+        pending: list[int] = []
+        last_key, last_own, k = 0, 0, 0
+
+        async def cb() -> None:
+            asked.append(n)
+            pending.append(n + answer_after)
+
+        src.keyframe_cb = cb
+        for n in range(pictures):
+            clock[0] = n / fps
+            if n in viewer_asks:
+                src.note_keyframe_request()
+                pending.append(n + answer_after)
+            length = gop + (jitter[k % len(jitter)] if jitter else 0)
+            own = n == 0 or (n - (last_own if fixed else last_key)) == length
+            own = (own and (stop_after is None or n <= stop_after)) or n in extras
+            key = own or any(p <= n for p in pending)
+            if own:
+                last_own, k = n, k + 1
+            if key:
+                last_key = n
+                pending[:] = [p for p in pending if p > n]
+            src._guard_gop(AccessUnit(b"", key, slices))
+            await asyncio.sleep(0)
+
+    asyncio.run(main())
+    return asked
+
+
+def test_own_gop_within_limit_stops_the_requests(monkeypatch):
+    # Backyard: its own keyframe at 282 comes before the answer to the request made at 280 (one second
+    # before 300 at 20 fps); after two such GOPs nothing is asked
+    asked = _camera(282, 282 * 10, monkeypatch=monkeypatch)
+    assert asked == [280, 293 + 280]
+
+
+def test_answer_before_own_keyframe_makes_no_extra_keyframes(monkeypatch):
+    # the answer comes first and the camera counts again from it: GOPs of 281, one keyframe each
+    asked = _camera(282, 282 * 6, answer_after=1, monkeypatch=monkeypatch)
+    assert asked == list(range(280, 282 * 6, 281))
+
+
+def test_fixed_rhythm_camera(monkeypatch):
+    asked = _camera(288, 288 * 10, fixed=True, answer_after=7, monkeypatch=monkeypatch)
+    assert len(asked) <= 3 and asked[0] == 280
+
+
+def test_viewer_keyframes_do_not_break_the_rhythm(monkeypatch):
+    asked = _camera(282, 282 * 10, viewer_asks=(1000, 1700), monkeypatch=monkeypatch)
+    assert asked == [280, 293 + 280]
+
+
+def test_extra_keyframes_of_the_camera_teach_nothing(monkeypatch):
+    # H.265+ adds a keyframe at a sudden change in the picture
+    asked = _camera(282, 282 * 10, extras=(1500, 2000), monkeypatch=monkeypatch)
+    assert asked == [280, 293 + 280]
+
+
+def test_gop_that_wanders_a_little(monkeypatch):
+    # Backyard, measured: 281 to 283 pictures
+    asked = _camera(282, 282 * 12, jitter=(1, -1, 0, 1, 0, -1), monkeypatch=monkeypatch)
+    assert len(asked) == 2
+
+
+def test_own_gop_beyond_the_limit_keeps_asking(monkeypatch):
+    # 3 slices: limit 100 pictures, never reached by a 282-picture GOP
+    asked = _camera(282, 282 * 3, slices=3, monkeypatch=monkeypatch)
+    # asked at 80, again half a second later (the answer takes 13 pictures), then 80 after the answers
+    assert asked[:3] == [80, 90, 103 + 80]
+
+
+def test_missing_camera_keyframe_brings_requests_back(monkeypatch):
+    # the camera stops making its own keyframes after picture 2000
+    asked = _camera(282, 282 * 12, stop_after=2000, monkeypatch=monkeypatch)
+    assert asked[:2] == [280, 293 + 280]
+    # its last own keyframe came at 1996; once 282 + 5 pictures pass without one, the guard is back to
+    # its normal rule and asks at once. The answer comes 13 pictures later: a GOP of 301 pictures, the
+    # one that Reolink's mp4 writer loses when the camera's rhythm breaks
+    assert asked[2] == 1996 + 288

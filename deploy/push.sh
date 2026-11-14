@@ -15,6 +15,12 @@ HOST=${1:-UCK-G2-Plus}
 cd "$(dirname "$0")/.."
 ROOT=/data/bcproxy
 
+# H.265 tile merging (bcproxy/hevcmerge.py) needs the library built for the Cloud Key's CPU
+LIB=bcproxy/native/libhevcmerge-aarch64.so
+if [ ! -f "$LIB" ] || [ bcproxy/native/hevcmerge.c -nt "$LIB" ]; then
+    echo "warning: $LIB is missing or older than hevcmerge.c; run bcproxy/native/build.sh aarch64" >&2
+fi
+
 # Swapped in as a whole: a running proxy keeps its loaded code, and a broken copy changes nothing
 # shellcheck disable=SC2086
 tar -cf - --exclude=__pycache__ --exclude='*.pyc' bcproxy tools deploy requirements.txt | ssh ${SSH_OPTS:-} "$HOST" "

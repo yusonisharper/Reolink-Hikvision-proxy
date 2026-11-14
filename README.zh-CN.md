@@ -44,6 +44,7 @@ python -m bcproxy -c config.yaml -v
 在 UCK-G2-Plus（UniFi OS 6.0.11，Debian 13，aarch64）上验证。全部文件都在 `/data/bcproxy`，开机由 systemd 启动。首次安装（Git Bash，在 `~/.ssh/config` 里配好 `UCK-G2-Plus`）：
 
 ```bash
+bcproxy/native/build.sh aarch64   # 在 WSL 或 Linux 里：为 Cloud Key 的 CPU 编译 H.265 tile 合并库
 deploy/push.sh --with-config      # 复制代码、config.yaml、state/，下载 Python 和 ffmpeg，启动服务
 deploy/push.sh                    # 以后更新代码：不动设备上的配置和 state/
 ```
@@ -139,11 +140,12 @@ Cloud Key Gen2 Plus（8 核 Cortex-A53，2.0 GHz）上带 8 台摄像头，NVR �
 |---|---|---|
 | VPS/SPS 声明 2 个时域子层（G1 关掉 SVC 也是这样） | NVR 的解码器改用 SVC 参考帧处理，P 帧解码失败 | 把 VPS/SPS 改写成单层（`hevcps.single_sub_layer`），只在没有参考帧集合保留多于 1 个短期参考帧时才改 |
 | VPS/SPS/PPS 超过 64 字节（含起始码）。G1 的 SPS 是 64 字节，H.265+ 下 81 字节 | Reolink 的 mp4 封装代码直接放弃：手机 App 提示下载错误，NVR 备份出空文件 | 去掉 SPS 里 VUI 的 HRD 参数（`hevcps.fit_mp4_limit`），变成 47 字节。解码用不到这些参数，摄像头也不发引用它们的 SEI |
-| 一个 GOP 用一次 `writev()` 写入，最多 600 片，每个 NAL 占 2 片，所以 GOP 帧数 × slice 数不能超过 300 | 整个 GOP 被丢掉（`v_io_count to big:600`），文件里几乎没有视频 | 统计每帧的 slice 数，在上限前 1 秒向摄像头请求关键帧（ISAPI `requestKeyFrame`，见 `StreamSource._guard_gop`） |
+| 一个 GOP 用一次 `writev()` 写入，最多 600 片，每个 NAL 占 2 片，所以 GOP 帧数 × slice 数不能超过 300 | 整个 GOP 被丢掉（`v_io_count to big:600`），文件里几乎没有视频 | 把每帧的几个 slice 合并成一个（`hevcmerge`，见下文），上限变成 300 帧。合并不了的帧，仍按 slice 数在上限前 1 秒向摄像头请求关键帧（ISAPI `requestKeyFrame`，见 `StreamSource._guard_gop`） |
 
 Reolink 的 mp4 封装代码（`bc_mp4_*`）在手机 App、Reolink Client（`libBCSDKWrapper.dll`）和 NVR 的备份里都有。以上结论来自用 Windows 客户端里的这份代码转换代理发出的帧（帧用 `tools/bc_client.py --raw` 抓取）。
 
-- **关键帧的代价：** 多占硬盘。3 个 slice 时一个 GOP 最多 100 帧：25 fps 下约 3.2 秒，而 H.265+ 自己能拉到 10 秒。帧率低时，同样 100 帧持续更久（15 fps 下 6.7 秒）。本来就不超限的码流不受影响。只对支持 `requestKeyFrame` 的海康摄像头生效。
+- **GOP 长度：** 合并成一个 slice 后，一个 GOP 最多 300 帧，25 fps 下 12 秒，比 H.265+ 的 10 秒还长，所以不用请求关键帧。不合并时（没有对应 CPU 的库、`merge_tiles: false`，或合并模块不支持的码流），3 个 slice 只允许 100 帧：25 fps 下约 3.2 秒（15 fps 下 6.7 秒），多出来的关键帧会多占硬盘。本来就不超限的码流不受影响。只有支持 `requestKeyFrame` 的海康摄像头会收到关键帧请求。
+- **摄像头自己的关键帧：** G1 开 H.265+、20 fps 时，在上一个关键帧（不管是它自己的还是被请求出来的）之后 282 帧（14.1 秒）自己出一个关键帧。在上限前 1 秒请求的话，第 282 帧来它自己的，6 帧后又来请求的回应：本来一个就够，结果出了两个。所以只要有两个以摄像头自己的关键帧结束的 GOP 长度一致（误差 2% 以内），而且这个长度在上限内，GOP 没超过这个长度时就不请求。更短的 GOP（H.265+ 在画面突变时会额外插关键帧）不参与学习。请求（GOP 保护发的，或新观看者触发的）之后 2 秒内来的关键帧算作回应，除非 2 秒内又来了一个。如果某个 GOP 超过了学到的长度，代理立刻请求并重新学习；这个 GOP 可能超出上限几帧，手机下载会丢掉这几秒。
 - 修复之前录下的录像，手机仍然下载不了。NVR 不转码直接下载到 U 盘不受影响。
 
 ## Motion Boxes
@@ -267,6 +269,24 @@ python tools/bc_client.py 127.0.0.1 -p change-me --preview subStream --out sub.h
 3. `captured/<id>.xml` 会优先于内置模板使用，型号、UID 等字段可以改成 `${model}`、`${uid}` 这样的占位符。
 4. 代理开启 `trace: true` 时，日志里的 `unhandled msg N` 就是还缺模板的消息。每个连接里同一个 ID 只警告一次。
 
+### 把 tile 合并成一个 slice
+
+`bcproxy/hevcmerge.py` 和 C 库 `bcproxy/native/hevcmerge.c` 把一帧的 3 个 slice 变成一个包含 3 个 tile 的 slice。不重新编码，解码出的像素完全相同：
+
+- 一帧的 3 个 slice，slice 头除了 slice 地址以外都一样。
+- 每个 tile 开头都会重新初始化 CABAC 上下文和算术解码器，不管它是单独一个 slice，还是大 slice 里的一个 tile；预测也从不跨越 tile 边界。
+- 合并后，原来 slice 边界上的环路滤波只由 `loop_filter_across_tiles_enabled_flag` 决定。只有滤波结果和合并前相同时才合并。
+
+码流里有两处变化。合并后的 slice 头多了入口点（每个 tile 的字节偏移）。除最后一个 tile 外，每个 tile 的结尾从 `end_of_slice_segment_flag` = 1 变成 `end_of_slice_segment_flag` = 0 加 `end_of_subset_one_bit` = 1：算术编码器结束前多了一个终止 bin，tile 最后几个 bit 随之改变。要算出这几个 bit，需要知道编码器在 tile 末尾的 range，所以库会对每个 tile 做熵解码：读出全部语法元素，但不重建像素，不推导运动矢量，也不做反变换。
+
+库支持 Main 和 Main 10、4:2:0、不带 WPP 的 tile、不含依赖 slice 段、不含 PPS 扩展，正是这些海康摄像头发的码流。其他情况，或者某帧解码不干净，就按原样发出，日志里每路码流每种原因记一次。每路码流在自己的线程里合并，大的关键帧既不会卡住事件循环，也不会耽误其他摄像头；大帧的几个 tile 并行解析。
+
+Cloud Key 上的开销（Cortex-A53，用录像实测）：1.8 Mbps 的主码流（Backyard）约占 11% 单核，4.4 Mbps（MainDoor）约 15%，G1 子码流约 1%。见过的最大关键帧 826 KB，合并用 88 ms；摄像头发送这一帧本身就要约 0.4 秒。
+
+用 Backyard、Camera23、MainDoor（旋转画面，1520×2688）和 MountainView（DS-2CD2347G2-LU）的录像验证过：每帧都合并成功；ffmpeg 解码合并后的码流，逐帧和原来相同（`framemd5`）；一个 IDR slice 的 bin 序列和 libde265 完全一致；用 Reolink Client 里 Reolink 的 mp4 封装代码转换 250 帧的 GOP，合并后的 mp4 一帧不少，未合并的码流转出来没有视频；在 AddressSanitizer 和 UBSan 下喂 6000 帧被破坏的数据，不崩溃也不泄漏内存。
+
+库按 CPU 分别编译，从 `bcproxy/native/libhevcmerge-<cpu>.so` 加载。`bcproxy/native/build.sh` 为当前机器编译，`build.sh aarch64` 为 Cloud Key 编译（需要 `gcc-aarch64-linux-gnu`；库不存在或比源码旧时，`deploy/push.sh` 会提醒）。Docker 镜像会自动编译。没有库时（例如在 Windows 上）不合并。在 `config.yaml` 里写 `merge_tiles: false` 可以关掉合并。
+
 ### 文件结构
 
 ```
@@ -275,6 +295,7 @@ bcproxy/
   bc.py         Baichuan 帧编解码（头部、magic、扩展 XML、二进制模式、FULL_AES）
   bcmedia.py    BcMedia 容器（InfoV2 / I 帧 / P 帧 / AAC），Annex-B 访问单元切分
   hevcps.py     H.265 VPS/SPS 改写（给 NVR 和 Reolink 的 mp4 封装代码）
+  hevcmerge.py  把一帧 H.265 的多个 tile slice 合并成一个 slice（C 库在 native/）
   session.py    服务端会话：登录协商、模板应答、设置写入、告警订阅(31/33)、预览(3/4)、抓图(109)
   camera.py     虚拟摄像头：海康事件 → 状态机 → 推送；能力位、改名、海康状态轮询
   discovery.py  局域网搜索应答（UDP 2000 → 3000）

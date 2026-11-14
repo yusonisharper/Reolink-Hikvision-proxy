@@ -24,6 +24,11 @@ unknown_reply: ok
 # A Reolink NVR does not support different ports on one IP, so each virtual camera needs its own IP.
 # alias_interface: eth0
 
+# H.265 pictures that a camera sends in several slices (Hikvision DS-2CD2347G1-L / G2-LU main stream: 3 tiles)
+# are sent on as one slice, which lets Reolink's mp4 downloads keep GOPs of up to 300 pictures instead of 100.
+# Lossless (no re-encoding), needs bcproxy/native/libhevcmerge-<cpu>.so (bcproxy/native/build.sh). On by default.
+# merge_tiles: true
+
 # Optional: port that receives Hikvision "HTTP Listening / Alarm Server" pushes (used when a camera's hik.events is listen)
 # hik_listen: 0.0.0.0:8088
 

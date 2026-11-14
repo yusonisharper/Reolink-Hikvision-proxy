@@ -15,4 +15,5 @@ log*.txt
 *.h264
 *.h265
 *.jpg
+bcproxy/native/*.so
 !tests/samples/*.h265

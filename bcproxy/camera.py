@@ -460,13 +460,14 @@ class VirtualCamera:
     async def request_keyframe(self, stream_type: str) -> None:
         if not self.hikcfg:
             return
+        src = self.main if stream_type == "mainStream" else self.sub
+        if src:
+            src.note_keyframe_request()
         try:
             if self.hikcfg.can_request_keyframe:
                 await self.hikcfg.request_keyframe(1 if stream_type == "mainStream" else 2)
-            else:
-                src = self.main if stream_type == "mainStream" else self.sub
-                if src:
-                    await src.request_keyframe()
+            elif src:
+                await src.request_keyframe()
         except (OSError, asyncio.TimeoutError, ValueError) as e:  # the next keyframe just comes by itself
             log.debug("%s: request keyframe: %s", self.cfg.name, e)
 

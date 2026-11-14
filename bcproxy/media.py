@@ -10,6 +10,7 @@ import time
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 
+from . import hevcmerge
 from .bcmedia import AccessUnit, AnnexBParser
 
 log = logging.getLogger("media")
@@ -23,7 +24,15 @@ KEYFRAME_REQUEST_EVERY = 5.0   # seconds between short sessions that ask for a k
 # GOP in one go from at most 600 pieces, two per NAL unit, and drops a GOP that needs more: the file
 # then holds no video. See StreamSource._guard_gop.
 MP4_GOP_PIECES = 600
+# A keyframe within this time after a request is taken as its answer, not as one the camera made by itself
+KEYFRAME_ANSWER_SECONDS = 2.0
 REPROBE_EVERY = 30.0           # seconds between probes caused by a new SPS
+
+
+def camera_gop_slack(period: int) -> int:
+    """How far the camera's own keyframes may stray from their rhythm, in pictures. Measured on
+    DS-2CD2347G1-L with H.265+: 285 to 290 pictures apart, around 288."""
+    return max(2, period // 50)
 
 
 @dataclass
@@ -174,6 +183,7 @@ async def read_access_units(url: str, codec: str, ffmpeg: str = "ffmpeg", first_
         ffmpeg, ["-hide_banner", "-loglevel", "error"], url,
         ["-map", "0:v:0", "-c:v", "copy", "-f", "h264" if codec == "H264" else "hevc", "pipe:1"])
     parser = AnnexBParser(codec)
+    merge = hevcmerge.stream_merger("playback", codec)
     timeout = first_timeout
     try:
         assert proc.stdout
@@ -193,8 +203,10 @@ async def read_access_units(url: str, codec: str, ffmpeg: str = "ffmpeg", first_
                 return
             timeout = stall_timeout
             for au in parser.feed(data):
-                yield au
+                yield (await merge(au)) if merge else au
     finally:
+        if merge:
+            merge.close()
         if proc.returncode is None:
             proc.kill()
         await proc.wait()
@@ -324,6 +336,12 @@ class StreamSource:
         self.keyframe_cb: Callable[[], Awaitable[None]] | None = None
         self._since_key = 0
         self._gop_asks = 0
+        # the camera's own longest GOP (see _guard_gop): the length of the last GOP that ended with a
+        # keyframe of the camera's own, and the length once two in a row agree
+        self._asked_at: float | None = None
+        self._own_last: int | None = None
+        self._own_gop: int | None = None
+        self._unsure: tuple[float, int] | None = None   # (time, GOP length) of a keyframe taken as an answer
         self._gop_logged = False
         self._gop_task: asyncio.Task | None = None
 
@@ -383,13 +401,24 @@ class StreamSource:
                 proc.kill()
                 await proc.wait()
 
+    def note_keyframe_request(self) -> None:
+        """A keyframe was asked for (by _guard_gop or for a new viewer): the next keyframe answers it."""
+        self._asked_at = time.monotonic()
+
     def _guard_gop(self, au: AccessUnit) -> None:
         """Keep each GOP short enough for Reolink's mp4 writer: at most MP4_GOP_PIECES // (2 * slices)
         pictures. Hikvision tiled streams (DS-2CD2347G1-L, DS-2CD2347G2-LU main: 3 slices per picture)
-        allow 100, and H.265+ makes GOPs of 120 to 250 pictures; the phone app then saves files with
-        no video. Ask the camera for a keyframe one second before the limit (it comes in under
-        0.7 s), and again every half second if none came."""
+        allow 100 unless hevcmerge makes them one slice, and H.265+ makes GOPs of 120 to 290 pictures;
+        the phone app then saves files with no video. Ask the camera for a keyframe one second before
+        the limit (it comes in under 0.7 s), and again every half second if none came.
+
+        Unless the camera's own keyframes come in time. DS-2CD2347G1-L with H.265+ at 20 fps makes one
+        282 pictures (14.1 s) after the last keyframe, its own or asked for. Asking at 275 gave its own
+        at 282 and the answer 6 pictures later. So once two GOPs that ended with a keyframe of the
+        camera's own agree in length, nothing is asked while the GOP is within that length and the
+        length fits the limit. A GOP that goes beyond it ends that until two agree again."""
         if au.keyframe:
+            self._camera_keyframe(self._since_key + 1)
             self._since_key, self._gop_asks = 0, 0
             return
         self._since_key += 1
@@ -397,6 +426,14 @@ class StreamSource:
             return
         limit = MP4_GOP_PIECES // (2 * max(1, au.slices))
         fps = self.info.fps if self.info and self.info.fps else 25
+        own = self._own_gop
+        if own is not None:
+            slack = camera_gop_slack(own)
+            if self._since_key > own + slack:
+                log.debug("%s: no keyframe of the camera's own after %d pictures", self.name, own)
+                self._own_gop = self._own_last = None
+            elif own + slack <= limit:
+                return
         # one second early: enough for the request (measured 0.25 s to the keyframe), and GOPs that
         # stay below the limit by themselves are left alone
         due = limit - fps + self._gop_asks * max(1, fps // 2)
@@ -407,7 +444,35 @@ class StreamSource:
             self._gop_logged = True
             log.info("%s: %d slices per picture: keyframe at least every %d pictures for Reolink's mp4 "
                      "writer", self.name, au.slices, limit)
+        self.note_keyframe_request()
         self._gop_task = asyncio.create_task(self.keyframe_cb(), name=f"gop-{self.name}")
+
+    def _camera_keyframe(self, gop: int) -> None:
+        """A keyframe that ends a GOP of `gop` pictures: learn from it if the camera made it by itself."""
+        now = time.monotonic()
+        answer = self._asked_at is not None and now - self._asked_at < KEYFRAME_ANSWER_SECONDS
+        self._asked_at = None
+        unsure, self._unsure = self._unsure, None
+        if answer:
+            # or the camera's own that came while the answer was on its way: see the next keyframe
+            self._unsure = (now, gop)
+        elif unsure is not None and now - unsure[0] < KEYFRAME_ANSWER_SECONDS:
+            # two keyframes close together after one request: the first was the camera's own
+            self._learn_camera_gop(unsure[1])
+        else:
+            self._learn_camera_gop(gop)
+
+    def _learn_camera_gop(self, gop: int) -> None:
+        """H.265+ adds keyframes of its own at a sudden change in the picture: shorter GOPs than the
+        known length teach nothing."""
+        own = self._own_gop
+        if own is not None and gop < own - camera_gop_slack(own):
+            return
+        agree = self._own_last is not None and abs(gop - self._own_last) <= camera_gop_slack(gop)
+        if agree and (own is None or abs(gop - own) > camera_gop_slack(own)):
+            self._own_gop = gop
+            log.debug("%s: the camera makes a keyframe %d pictures after the last one", self.name, gop)
+        self._own_last = gop
 
     def _reprobe_soon(self) -> None:
         """A new SPS on a running connection: rotating the image changes the size without dropping it."""
@@ -439,6 +504,7 @@ class StreamSource:
                 self.ffmpeg, ["-hide_banner", "-loglevel", "error"], self.url,
                 ["-map", "0:v:0", "-c:v", "copy", "-f", fmt, "pipe:1"], file_args=("-re", "-stream_loop", "-1"))
             parser = AnnexBParser(info.codec)
+            merge = hevcmerge.stream_merger(self.name, info.codec)
             sps_type, sps = (7 if info.codec == "H264" else 33), None
             log.info("%s: ffmpeg started (pid %s)", self.name, proc.pid)
             live = _LiveReader(self.name, proc)
@@ -455,9 +521,12 @@ class StreamSource:
                         if sps is not None:
                             self._reprobe_soon()
                         sps = new_sps
+                    now = time.monotonic()
                     for au in aus:
+                        if merge:
+                            au = await merge(au)
                         self._guard_gop(au)
-                        item = (time.monotonic(), au)
+                        item = (now, au)
                         for q in list(self.subs):
                             if q.full():
                                 # viewer too slow: drop its backlog, resume at next keyframe
@@ -472,6 +541,8 @@ class StreamSource:
                 raise
             finally:
                 live.close()
+                if merge:
+                    merge.close()
                 if proc.returncode is None:
                     proc.kill()
                     await proc.wait()
