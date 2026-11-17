@@ -29,6 +29,55 @@ KEYFRAME_ANSWER_SECONDS = 2.0
 REPROBE_EVERY = 30.0           # seconds between probes caused by a new SPS
 
 
+class FrameClock:
+    """Even live frame times, like a real camera's capture clock. Hikvision cameras send a big keyframe
+    slowly: DS-2CD2347G1-L (Kitchen, 2026-11-16) stopped for ~250 ms before each keyframe and then sent
+    a dozen frames at once. Stamped with their arrival time those frames carried the same time, and the
+    Reolink app played that as a stop followed by fast-forward (Hik-Connect, with the camera's own times,
+    played smoothly). Here each frame is one frame interval after the last, the interval measured over
+    the last WINDOW seconds, and the times are steered gently towards the arrival times so that they
+    keep pace with the camera. Never backwards: Reolink live view stops for good when time goes back."""
+
+    WINDOW = 5.0      # seconds of arrivals for the frame interval
+    GAIN = 0.02       # share of the distance to the arrival time made up per frame...
+    STEER = 0.03      # ...but at most this share of a frame interval (3 % faster or slower: unseen)
+    # seconds behind the arrival time: the stream stalled, jump to now. As far ahead (the frames
+    # held up by that stall then came at once): half intervals until caught up.
+    RESYNC = 1.0
+
+    def __init__(self) -> None:
+        self.last: float | None = None
+        self._arrivals: collections.deque[float] = collections.deque()
+
+    def interval(self, fps: int) -> float:
+        a = self._arrivals
+        if len(a) >= 20 and a[-1] - a[0] >= 3.0:    # not the burst a new connection starts with
+            return (a[-1] - a[0]) / (len(a) - 1)
+        return 1.0 / (fps if fps > 0 else 25)
+
+    def stamp(self, arrival: float, fps: int = 25) -> float:
+        a = self._arrivals
+        a.append(arrival)
+        while a[0] < arrival - self.WINDOW:
+            a.popleft()
+        step = self.interval(fps)
+        last = self.last
+        if last is None:
+            ts = arrival
+        else:
+            ts = last + step
+            behind = arrival - ts
+            if behind > self.RESYNC:
+                ts = arrival
+            elif behind < -self.RESYNC:
+                ts = last + step / 2
+            else:
+                ts += max(-self.STEER * step, min(self.STEER * step, behind * self.GAIN))
+            ts = max(ts, last + step / 2)
+        self.last = ts
+        return ts
+
+
 def camera_gop_slack(period: int) -> int:
     """How far the camera's own keyframes may stray from their rhythm, in pictures. Measured on
     DS-2CD2347G1-L with H.265+: 285 to 290 pictures apart, around 288."""
@@ -336,6 +385,7 @@ class StreamSource:
         self._task: asyncio.Task | None = None
         self._stop_handle: asyncio.TimerHandle | None = None
         self.rate = RateMeter()
+        self.clock = FrameClock()    # kept across ffmpeg restarts, so that the time only goes forward
         # asks the camera for a keyframe (set by the camera when it has a call for that); see _guard_gop
         self.keyframe_cb: Callable[[], Awaitable[None]] | None = None
         self._since_key = 0
@@ -530,7 +580,7 @@ class StreamSource:
                         if merge:
                             au = await merge(au)
                         self._guard_gop(au)
-                        item = (now, au)
+                        item = (self.clock.stamp(now, self.info.fps if self.info else info.fps), au)
                         for q in list(self.subs):
                             if q.full():
                                 # viewer too slow: drop its backlog, resume at next keyframe
